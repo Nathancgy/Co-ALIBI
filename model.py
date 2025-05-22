@@ -1,178 +1,233 @@
-# model.py
-import math
 import torch
-import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
+import math
 
-from config import GPTConfig
-from penalized_attention import PenalizedAttention # Your custom attention
-
-class StandardAttention(nn.Module):
+class CoALIBI(torch.autograd.Function):
     """
-    A standard multi-head self-attention module as in NanoGPT.
-    Includes causal masking.
+    Raw PyTorch implementation of Co-ALIBI attention with explicit backward pass.
+    Assumes Q, K, V are (batch_size, num_heads, seq_len, head_dim).
+    Implements causal attention.
+    Not optimized for speed or memory (no tiling).
     """
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # Key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # Output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # Regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        self.config = config
 
-        # Flash Attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # Causal mask to ensure attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size, dtype=torch.bool))
-                                        .view(1, 1, config.block_size, config.block_size))
+    @staticmethod
+    def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale_factor: float):
+        # Input shapes:
+        # q: (B, H, N_q, D_h) - Query
+        # k: (B, H, N_k, D_h) - Key
+        # v: (B, H, N_v, D_h) - Value (N_v typically equals N_k)
+        # scale_factor: float, e.g., 1.0 / math.sqrt(D_h)
 
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        B, H, N_q, D_h = q.shape
+        N_k = k.shape[2] # Key sequence length
+        # N_v = v.shape[2] # Value sequence length, should be N_k
 
-        # Calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        head_dim = C // self.n_head
-        q = q.view(B, T, self.n_head, head_dim).transpose(1, 2) # (B, nh, T, hs)
-        k = k.view(B, T, self.n_head, head_dim).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, head_dim).transpose(1, 2) # (B, nh, T, hs)
+        # 1. Raw Scores (P_raw)
+        # P_raw_tτ = q_t^T k_τ * scale_factor
+        # Result shape: (B, H, N_q, N_k)
+        p_raw = torch.einsum('bhid,bhjd->bhij', q, k) * scale_factor
 
-        # Causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # Efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # Manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # Create causal mask
+        # mask_value is a large negative number for numerical stability in softmax
+        mask_value = -torch.finfo(p_raw.dtype).max
+        # mask_bool is True for positions to be masked (upper triangle, query i cannot attend to key j if j > i)
+        mask_bool = torch.triu(torch.ones(N_q, N_k, device=q.device, dtype=torch.bool), diagonal=1)
+        # Expand mask for batch and head dimensions
+        expanded_mask_bool = mask_bool.unsqueeze(0).unsqueeze(0) # (1, 1, N_q, N_k)
+
+        # Apply causal mask to raw scores
+        p_raw_masked = p_raw.masked_fill(expanded_mask_bool, mask_value)
+
+        # 2. Sigmas of Raw Scores (Sigma_p_raw)
+        # σ(p_tτ)
+        # For masked positions (large negative p_raw_masked), sigmoid will be ~0.
+        # We explicitly mask to 0.0 to ensure no contribution to Z_penalty from masked positions.
+        sig_p_raw = torch.sigmoid(p_raw_masked).masked_fill(expanded_mask_bool, 0.0)
+
+        # 3. Penalty Term (Z_penalty)
+        # Z_tτ_penalty = sum_{j=τ to t} σ(p_tj)
+        # This is a suffix cumulative sum for each row (query t) over keys j.
+        # The causal mask on sig_p_raw (making sigmas for j>t zero) ensures the sum is effectively up to t.
+        z_penalty = torch.cumsum(sig_p_raw.flip(dims=[-1]), dim=-1).flip(dims=[-1])
+
+        # 4. Adjusted Scores (P_adjusted)
+        # p'_tτ = p_tτ - Z_tτ_penalty
+        # Use p_raw_masked to ensure masked positions remain large negative.
+        p_adjusted = p_raw_masked - z_penalty
+        # Re-apply mask to p_adjusted to be absolutely sure.
+        p_adjusted = p_adjusted.masked_fill(expanded_mask_bool, mask_value)
+
+        # 5. Attention Weights (S) - Softmax
+        # Numerically stable softmax:
+        # m_t = max_τ(p'_tτ)
+        m_softmax = torch.max(p_adjusted, dim=-1, keepdim=True).values
+        # p'_adj_minus_max = p'_tτ - m_t
+        p_adj_minus_max = p_adjusted - m_softmax
         
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # Re-assemble all head outputs side by side
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+        s_unnormalized = torch.exp(p_adj_minus_max)
+        # Mask again after exp, as exp(mask_value) -> 0
+        s_unnormalized = s_unnormalized.masked_fill(expanded_mask_bool, 0.0)
 
-class MLP(nn.Module):
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU(approximate='tanh')
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-class Block(nn.Module):
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd, bias=config.bias)
-        if config.model_type == 'penalized':
-            self.attn = PenalizedAttention(config)
-        elif config.model_type == 'standard':
-            self.attn = StandardAttention(config)
-        else:
-            raise ValueError(f"Unknown model_type: {config.model_type}")
-        self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
-
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
-
-class GPT(nn.Module):
-    def __init__(self, config: GPTConfig):
-        super().__init__()
-        assert config.vocab_size is not None
-        assert config.block_size is not None
-        self.config = config
-
-        modules = dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd, bias=config.bias),
-        )
-        if config.model_type == 'standard':
-            modules['wpe'] = nn.Embedding(config.block_size, config.n_embd) # Positional embeddings for standard model
+        # lse_t = sum_τ exp(p'_tτ - m_t)
+        lse_softmax = torch.sum(s_unnormalized, dim=-1, keepdim=True)
+        # Add a small epsilon to lse to prevent division by zero if all scores are masked
+        lse_softmax = lse_softmax + 1e-9 
         
-        self.transformer = nn.ModuleDict(modules)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight
+        s = s_unnormalized / lse_softmax # Final attention weights S_tτ
+        s = s.masked_fill(expanded_mask_bool, 0.0) # Final check on masking for s
 
-        self.apply(self._init_weights)
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        # 6. Output (O)
+        # O_t = sum_τ S_tτ V_τ
+        # (B, H, N_q, N_k) @ (B, H, N_k, D_h) -> (B, H, N_q, D_h)
+        o = torch.einsum('bhij,bhjd->bhid', s, v)
 
-        print(f"Number of parameters for model type '{config.model_type}': {self.get_num_params()/1e6:.2f}M")
+        # Save tensors for backward pass
+        # p_raw is needed for σ'(p_raw)
+        # sig_p_raw is σ(p_raw), useful for σ' = σ(1-σ)
+        # s contains the final attention probabilities
+        # m_softmax, lse_softmax are for stable softmax backward
+        ctx.save_for_backward(q, k, v, s, p_raw, sig_p_raw, m_softmax, lse_softmax)
+        ctx.scale_factor = scale_factor
+        ctx.causal_mask_bool = expanded_mask_bool # Save the expanded boolean mask
 
-    def get_num_params(self, non_embedding=True):
-        n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding and self.config.model_type == 'standard': # Standard NanoGPT non_embedding count
-             n_params -= self.transformer.wpe.weight.numel()
-        return n_params
+        return o
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    @staticmethod
+    def backward(ctx, do: torch.Tensor):
+        # do: (B, H, N_q, D_h), gradient of loss w.r.t. output o
+        q, k, v, s, p_raw, sig_p_raw, m_softmax, lse_softmax = ctx.saved_tensors
+        scale_factor = ctx.scale_factor
+        causal_mask_bool = ctx.causal_mask_bool
 
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        B, H, N_q, D_h = q.shape
+        N_k = k.shape[2]
 
-        tok_emb = self.transformer.wte(idx)
+        # Initialize gradients
+        dq = torch.zeros_like(q)
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
+
+        # Step 1: Gradient w.r.t. Value (dV)
+        # dV_τ = sum_t s_tτ * dO_t
+        # s is (B, H, N_q, N_k). Transpose for einsum: (B, H, N_k, N_q)
+        # do is (B, H, N_q, D_h)
+        # dv should be (B, H, N_k, D_h)
+        # Original formula: dV_τ = sum_t s_tτ * dO_t  (sum over query_t, output for key_τ)
+        # s[b,h,query,key], do[b,h,query,dim] -> dv[b,h,key,dim]
+        # einsum: 'bhij,bhid->bhjd' where i=query, j=key, d=dim
+        dv = torch.einsum('bhij,bhid->bhjd', s, do)
+
+        # Step 2: Gradient w.r.t. attention scores S (ds)
+        # ds_tτ = dO_t^T V_τ
+        # do is (B, H, N_q, D_h)
+        # v is (B, H, N_k, D_h).
+        # ds should be (B, H, N_q, N_k)
+        ds = torch.einsum('bhid,bhjd->bhij', do, v)
+
+        # Step 3: Gradient w.r.t. Adjusted Scores P' (dp_adjusted) - Softmax backward
+        # dp'_tτ = s_tτ * (ds_tτ - D_t)
+        # where D_t = sum_α ds_tα * s_tα for query t.
+        # D_t_sum_ds_s = (ds * s).sum(dim=-1, keepdim=True) # (B, H, N_q, 1)
+        # dp_adjusted = s * (ds - D_t_sum_ds_s)
         
-        if self.config.model_type == 'standard':
-            pos = torch.arange(0, t, dtype=torch.long, device=device)
-            pos_emb = self.transformer.wpe(pos) # (t, n_embd)
-            x = self.transformer.drop(tok_emb + pos_emb)
-        else: # Penalized model does not use wpe
-            x = self.transformer.drop(tok_emb)
-            
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+        # Alternative for softmax backward using saved m and lse (often used in FlashAttention for stability)
+        # s = exp(p_adjusted - m_softmax) / lse_softmax
+        # dL/dp_adjusted_ij = s_ij * (dL/ds_ij - sum_k(dL/ds_ik * s_ik))
+        # This is equivalent to:
+        d_softmax_sum = torch.sum(ds * s, dim=-1, keepdim=True) # (B, H, N_q, 1)
+        dp_adjusted = s * (ds - d_softmax_sum)
+        
+        # Mask out gradients for positions that were causally masked
+        dp_adjusted = dp_adjusted.masked_fill(causal_mask_bool, 0.0)
 
-        if targets is not None:
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            logits = self.lm_head(x[:, [-1], :])
-            loss = None
+        # Step 4 & 5: Gradient w.r.t. Raw Scores P_raw (dp_raw) via Penalty
+        # dp_tμ = dp'_tμ - σ'(p_tμ) * C_tμ
+        # where C_tμ = sum_{α=1 to μ} dp'_tα (prefix sum of dp_adjusted for query t)
+        # And σ'(p) = σ(p) * (1 - σ(p))
 
-        return logits, loss
+        # sig_p_raw was saved as σ(p_raw)
+        # Note: p_raw used for sigma_prime was already masked in forward.
+        # So sig_p_raw for masked positions is 0. sigma_prime will also be 0.
+        sigma_prime_p_raw = sig_p_raw * (1.0 - sig_p_raw) # σ'(p_raw_tμ)
 
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        # (Same as before)
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / temperature
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
+        # Prefix sum for dp_adjusted: C_tμ
+        # For each query row (dim N_q), cumsum over key columns (dim N_k)
+        c_prefix_sum_dp_prime = torch.cumsum(dp_adjusted, dim=-1)
+
+        # Gradient contribution from the penalty path
+        # dL/dp_raw (via Z) = sum_{alpha<=mu} [ dL/dp'_alpha * (dp'_alpha/dZ_alpha) * (dZ_alpha/dp_raw_mu) ]
+        # dL/dp'_alpha * (-1) * sigma'(p_raw_mu)
+        dp_raw_from_penalty_path = -sigma_prime_p_raw * c_prefix_sum_dp_prime
+        
+        # Total dp_raw: gradient from p_adjusted directly + gradient from penalty path
+        # dL/dp_raw_mu (direct) = dL/dp'_mu * (dp'_mu / dp_raw_mu) = dL/dp'_mu * 1
+        dp_raw = dp_adjusted + dp_raw_from_penalty_path
+        
+        # Mask out gradients again for causally masked positions
+        dp_raw = dp_raw.masked_fill(causal_mask_bool, 0.0)
+
+        # Step 6: Gradients w.r.t. Q and K
+        # dp_raw is dL/dp_tτ (shape: B, H, N_q, N_k)
+        # dQ_t = scale_factor * sum_τ dp_tτ * K_τ
+        # dq should be (B, H, N_q, D_h)
+        # k is (B, H, N_k, D_h)
+        dq = torch.einsum('bhij,bhjd->bhid', dp_raw, k) * scale_factor
+
+        # dK_τ = scale_factor * sum_t dp_tτ * Q_t
+        # dk should be (B, H, N_k, D_h)
+        # q is (B, H, N_q, D_h)
+        # Formula: dK_τ = scale_factor * sum_t dp_tτ * Q_t
+        # dp_raw[b,h,t,τ] (t=Nq, τ=Nk), q[b,h,t,d] (t=Nq, d=Dh) -> dk[b,h,τ,d]
+        # einsum: 'bhij,bhid->bhjd' (i=Nq for dp_raw&q, j=Nk for dp_raw, d=Dh for q)
+        dk = torch.einsum('bhij,bhid->bhjd', dp_raw, q) * scale_factor
+        
+        return dq, dk, dv, None # For scale_factor if it doesn't require grad
+
+# Example Usage:
+if __name__ == '__main__':
+    B, H, N, D = 2, 3, 5, 4 # Batch, Heads, SeqLen, HeadDim
+    q_test = torch.randn(B, H, N, D, requires_grad=True, dtype=torch.float64)
+    k_test = torch.randn(B, H, N, D, requires_grad=True, dtype=torch.float64)
+    v_test = torch.randn(B, H, N, D, requires_grad=True, dtype=torch.float64)
+    scale = 1.0 / math.sqrt(D)
+
+    # Test with PyTorch's autograd
+    def co_alibi_simple_forward(q, k, v, scale_factor):
+        p_raw = torch.einsum('bhid,bhjd->bhij', q, k) * scale_factor
+        mask_bool = torch.triu(torch.ones(N, N, device=q.device, dtype=torch.bool), diagonal=1)
+        expanded_mask_bool = mask_bool.unsqueeze(0).unsqueeze(0)
+        
+        p_raw_masked_for_sigma = p_raw.masked_fill(expanded_mask_bool, -1e9)
+        sig_p_raw = torch.sigmoid(p_raw_masked_for_sigma).masked_fill(expanded_mask_bool, 0.0)
+        
+        z_penalty = torch.cumsum(sig_p_raw.flip(dims=[-1]), dim=-1).flip(dims=[-1])
+        
+
+        mask_value_softmax = -torch.finfo(p_raw.dtype).max
+        p_raw_masked_for_softmax = p_raw.masked_fill(expanded_mask_bool, mask_value_softmax)
+        p_adjusted = p_raw_masked_for_softmax - z_penalty
+        p_adjusted = p_adjusted.masked_fill(expanded_mask_bool, mask_value_softmax)
+        
+        s = F.softmax(p_adjusted, dim=-1)
+        s = s.masked_fill(expanded_mask_bool, 0.0)
+        o = torch.einsum('bhij,bhjd->bhid', s, v)
+        return o
+
+    print("Running custom CoALIBI...")
+    output_custom = CoALIBI.apply(q_test, k_test, v_test, scale)
+    do_test_custom = torch.randn_like(output_custom, dtype=torch.float64)
+    output_custom.backward(do_test_custom)
+    dq_custom, dk_custom, dv_custom = q_test.grad.clone(), k_test.grad.clone(), v_test.grad.clone()
+    
+    print("dq_custom norm:", torch.linalg.norm(dq_custom).item())
+    print("dk_custom norm:", torch.linalg.norm(dk_custom).item())
+    print("dv_custom norm:", torch.linalg.norm(dv_custom).item())
+    
+    q_test_gc = q_test.detach().clone().requires_grad_(True)
+    k_test_gc = k_test.detach().clone().requires_grad_(True)
+    v_test_gc = v_test.detach().clone().requires_grad_(True)
+    
+    print("\nRunning gradcheck...")
+    inputs_for_gradcheck = (q_test_gc, k_test_gc, v_test_gc, scale)
+    test_passed = torch.autograd.gradcheck(CoALIBI.apply, inputs_for_gradcheck, eps=1e-6, atol=1e-4)
+    print(f"Gradcheck passed: {test_passed}")
