@@ -128,7 +128,7 @@ def _co_alibi_fwd_kernel(
     o_block = acc_o / l_i_safe
     
     out_ptrs = Out + pid_b * out_stride_b + pid_h * out_stride_h + \
-               offs_m[:, None] * out_stride_m + offs_d[None, :] * out_stride_k
+               offs_m[:, None] * out_stride_m + offs_d[None, :] * out_stride_d
     tl.store(out_ptrs, o_block.to(Out.dtype.element_ty), mask=(offs_m[:, None] < seq_len_q) & (offs_d[None,:] < head_dim))
 
     lse_val = m_i + tl.log(l_i_safe)

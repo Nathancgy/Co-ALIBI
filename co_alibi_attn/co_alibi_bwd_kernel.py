@@ -150,7 +150,7 @@ def _co_alibi_bwd_kernel(
         # dP_raw_block is (BLOCK_M, BLOCK_N_KV), Q_block is (BLOCK_M, DMODEL)
         dk_contrib = tl.dot(tl.trans((dp_raw_block * sm_scale).to(DK.dtype.element_ty)), q_block.to(DK.dtype.element_ty))
         dk_ptrs = DK + pid_b * dk_stride_b + pid_h * dk_stride_h + \
-                  offs_n_kv[:, None] * dk_stride_n + offs_d[None, :] * dk_stride_d
+                  offs_n_kv[:, None] * dk_stride_n + offs_d[None, :] * dk_stride_k
         tl.atomic_add(dk_ptrs, dk_contrib, mask=(offs_n_kv[:, None] < seq_len_kv) & (offs_d[None,:] < head_dim))
         
         # --- Step 6 (from math): Accumulate dQ contribution ---
