@@ -23,7 +23,9 @@ class CoALIBIAttention(torch.autograd.Function):
         z_penalty = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=torch.float32)
         lse = torch.empty((batch_size, num_heads, seq_len_q), device=q.device, dtype=torch.float32)
 
-        causal_mask_value_fwd = -torch.finfo(torch.float32).max if causal else 0.0
+        # causal_mask_value is only used if HAS_CAUSAL_MASK is true in the kernel.
+        # In that case, it must be -inf.
+        causal_mask_value_fwd = -torch.finfo(torch.float32).max 
 
         N_CTX_KV_triton = triton.next_power_of_2(seq_len_kv)
         BLOCK_M_triton = 32 
