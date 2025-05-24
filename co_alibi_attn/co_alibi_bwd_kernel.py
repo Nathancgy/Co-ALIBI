@@ -94,43 +94,53 @@ def _co_alibi_bwd_kernel(
         # --- Step 1 (from math): Recompute S_block (Attention Probabilities) ---
         # p_adjusted = p_raw - z_penalty
         p_adjusted_block = p_raw_block - z_penalty_block
+
+        # Define causal condition once for this scope if HAS_CAUSAL_MASK
+        causal_cond_mask = offs_m_q[:, None] < offs_n_kv[None, :] # True if key is future to query, so mask
+
         if HAS_CAUSAL_MASK:
-            causal_cond = offs_m_q[:, None] < offs_n_kv[None, :]
-            p_adjusted_block = tl.where(causal_cond, causal_mask_value, p_adjusted_block)
+            # causal_cond was here in the original file. Use causal_cond_mask
+            p_adjusted_block = tl.where(causal_cond_mask, causal_mask_value, p_adjusted_block)
         
         # s = exp(p_adjusted - lse)
-        s_block = tl.exp(p_adjusted_block - lse_row) # lse_row is (BLOCK_M, 1)
+        _s_block_fp32 = tl.exp(p_adjusted_block - lse_row) # lse_row is (BLOCK_M, 1), compute in fp32
+        s_block = _s_block_fp32.to(Q.dtype.element_ty)   # Cast to Q's dtype (e.g., fp16)
+
         if HAS_CAUSAL_MASK:
-            s_block = tl.where(causal_cond, 0.0, s_block)
+            s_block = tl.where(causal_cond_mask, 0.0, s_block)
         # Mask S for queries out of bounds (e.g. padding queries)
         s_block = tl.where(offs_m_q[:, None] < seq_len_q, s_block, 0.0)
 
         # --- Step 2 (from math): Calculate dS_block = DO @ V.T --- (BLOCK_M, BLOCK_N_KV)
-        ds_block = tl.dot(do_block, tl.trans(v_block))
+        ds_block = tl.dot(do_block.to(tl.float32), tl.trans(v_block.to(tl.float32)))
 
         # --- Step 3 (from math): Calculate dP_adjusted_block (Softmax Backward) ---
         # dP'_tτ = S_tτ * (dS_tτ - sum_α dS_tα * S_tα)
         # sum_ds_s needs to be row-wise sum over N_KV dim: (BLOCK_M, 1)
-        sum_ds_s = tl.sum(ds_block * s_block, axis=1)[:, None] # Keep dim for broadcasting
-        dp_adjusted_block = s_block * (ds_block - sum_ds_s)
+        sum_ds_s = tl.sum(ds_block * s_block.to(tl.float32), axis=1)[:, None] # Keep dim for broadcasting, use s_block as fp32 for product
+        dp_adjusted_block = s_block.to(tl.float32) * (ds_block - sum_ds_s) # use s_block as fp32 for product
+        
         if HAS_CAUSAL_MASK:
-            dp_adjusted_block = tl.where(causal_cond, 0.0, dp_adjusted_block)
+            # Use the already defined causal_cond_mask
+            dp_adjusted_block = tl.where(causal_cond_mask, 0.0, dp_adjusted_block)
         dp_adjusted_block = tl.where(offs_m_q[:, None] < seq_len_q, dp_adjusted_block, 0.0)
 
         # --- Step 4 & 5 (from math): Calculate dP_raw_block via Penalty --- 
         # dP_raw_tμ = dP'_tμ - σ'(P_raw_tμ) * C_tμ
         # σ'(P_raw) = σ(P_raw) * (1 - σ(P_raw))
-        sigma_prime_block = sig_p_raw_block * (1.0 - sig_p_raw_block)
+        sig_p_raw_block_fp32 = sig_p_raw_block.to(tl.float32)
+        sigma_prime_block = sig_p_raw_block_fp32 * (1.0 - sig_p_raw_block_fp32)
 
         # Calculate C_tμ = prefix_sum(dP'_tα) for the current block
-        # This is a local prefix sum within the current dp_adjusted_block for each row.
-        # And it needs to be added to the sum from previous blocks (c_prefix_sum_acc_row).
+        # This needs to account for accumulation from previous blocks
         c_local_prefix_sum_dp_adj = tl.cumsum(dp_adjusted_block, axis=1)
+        # Add the accumulated sum from previous blocks to each element
         c_block = c_prefix_sum_acc_row + c_local_prefix_sum_dp_adj
         
         dp_raw_block = dp_adjusted_block - sigma_prime_block * c_block
         if HAS_CAUSAL_MASK:
-            dp_raw_block = tl.where(causal_cond, 0.0, dp_raw_block)
+            # Fixed: Use consistent causal condition
+            dp_raw_block = tl.where(causal_cond_mask, 0.0, dp_raw_block)
         dp_raw_block = tl.where(offs_m_q[:, None] < seq_len_q, dp_raw_block, 0.0)
         
         # Update the running prefix sum for the next iteration of key blocks
@@ -140,23 +150,24 @@ def _co_alibi_bwd_kernel(
         # --- Step 1 (from math, re-stated): Calculate dV contribution --- (BLOCK_N_KV, DMODEL)
         # dV_contrib = S_block.T @ DO_block
         # S_block is (BLOCK_M, BLOCK_N_KV), DO_block is (BLOCK_M, DMODEL)
-        dv_contrib = tl.dot(tl.trans(s_block.to(DV.dtype.element_ty)), do_block.to(DV.dtype.element_ty))
+        # Keep math in fp32 for accuracy, cast only when writing
+        dv_contrib = tl.dot(tl.trans(s_block.to(tl.float32)), do_block.to(tl.float32))
         dv_ptrs = DV + pid_b * dv_stride_b + pid_h * dv_stride_h + \
                   offs_n_kv[:, None] * dv_stride_n + offs_d[None, :] * dv_stride_d
-        tl.atomic_add(dv_ptrs, dv_contrib, mask=(offs_n_kv[:, None] < seq_len_kv) & (offs_d[None,:] < head_dim))
+        tl.atomic_add(dv_ptrs, dv_contrib.to(DV.dtype.element_ty), mask=(offs_n_kv[:, None] < seq_len_kv) & (offs_d[None,:] < head_dim))
 
         # --- Step 6 (from math): Calculate dK contribution ---
         # dK_contrib = (dP_raw_block * sm_scale).T @ Q_block
         # dP_raw_block is (BLOCK_M, BLOCK_N_KV), Q_block is (BLOCK_M, DMODEL)
-        dk_contrib = tl.dot(tl.trans((dp_raw_block * sm_scale).to(DK.dtype.element_ty)), q_block.to(DK.dtype.element_ty))
+        dk_contrib = tl.dot(tl.trans(dp_raw_block * sm_scale), q_block.to(tl.float32))
         dk_ptrs = DK + pid_b * dk_stride_b + pid_h * dk_stride_h + \
                   offs_n_kv[:, None] * dk_stride_n + offs_d[None, :] * dk_stride_k
-        tl.atomic_add(dk_ptrs, dk_contrib, mask=(offs_n_kv[:, None] < seq_len_kv) & (offs_d[None,:] < head_dim))
+        tl.atomic_add(dk_ptrs, dk_contrib.to(DK.dtype.element_ty), mask=(offs_n_kv[:, None] < seq_len_kv) & (offs_d[None,:] < head_dim))
         
         # --- Step 6 (from math): Accumulate dQ contribution ---
         # dQ_acc += (dP_raw_block * sm_scale) @ K_block.T
         # dP_raw_block is (BLOCK_M, BLOCK_N_KV), K_block is (DMODEL, BLOCK_N_KV)
-        dq_acc += tl.dot((dp_raw_block * sm_scale).to(Q.dtype.element_ty), tl.trans(k_block.to(Q.dtype.element_ty)))
+        dq_acc += tl.dot(dp_raw_block * sm_scale, tl.trans(k_block.to(tl.float32)))
 
     # --- Store final dQ --- (BLOCK_M, DMODEL)
     dq_ptrs = DQ + pid_b * dq_stride_b + pid_h * dq_stride_h + \

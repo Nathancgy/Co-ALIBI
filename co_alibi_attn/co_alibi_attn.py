@@ -18,28 +18,28 @@ class CoALIBIAttention(torch.autograd.Function):
 
         o = torch.empty_like(q)
         
-        p_raw_for_bwd = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=torch.float32)
-        sig_p_raw = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=torch.float32)
-        z_penalty = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=torch.float32)
+        p_raw_for_bwd = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=q.dtype)
+        sig_p_raw = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=q.dtype)
+        z_penalty = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=q.dtype)
         lse = torch.empty((batch_size, num_heads, seq_len_q), device=q.device, dtype=torch.float32)
 
         # causal_mask_value is only used if HAS_CAUSAL_MASK is true in the kernel.
         # In that case, it must be -inf.
         causal_mask_value_fwd = -torch.finfo(torch.float32).max 
 
-        N_CTX_KV_triton = triton.next_power_of_2(seq_len_kv)
-        BLOCK_M_triton = 32 
-        BLOCK_N_KV_triton = 64
+        BLOCK_M_triton = 32
+        BLOCK_N_triton = 64
         
-        if head_dim <= 16: BLOCK_DMODEL_triton = 16
-        elif head_dim <= 32: BLOCK_DMODEL_triton = 32
-        elif head_dim <= 64: BLOCK_DMODEL_triton = 64
-        elif head_dim <= 128: BLOCK_DMODEL_triton = 128
-        else: 
-            BLOCK_DMODEL_triton = 128 
-        if head_dim in [16,32,64,128]:
-            BLOCK_DMODEL_triton = head_dim
+        if head_dim <= 16: BLOCK_D_triton = 16
+        elif head_dim <= 32: BLOCK_D_triton = 32
+        elif head_dim <= 64: BLOCK_D_triton = 64
+        elif head_dim <= 128: BLOCK_D_triton = 128
+        else:
+            BLOCK_D_triton = 128
+        if head_dim in [16, 32, 64, 128]:
+            BLOCK_D_triton = head_dim
 
+        kv_blocks = (seq_len_kv + BLOCK_N_triton - 1) // BLOCK_N_triton
         grid = (triton.cdiv(seq_len_q, BLOCK_M_triton), batch_size * num_heads)
         
         _co_alibi_fwd_kernel[grid](
@@ -56,8 +56,7 @@ class CoALIBIAttention(torch.autograd.Function):
             lse_out_stride_b=lse.stride(0), lse_out_stride_h=lse.stride(1), lse_out_stride_m=lse.stride(2),
             batch_size=batch_size, num_heads=num_heads, seq_len_q=seq_len_q, seq_len_kv=seq_len_kv, head_dim=head_dim,
             HAS_CAUSAL_MASK=causal, 
-            BLOCK_M=BLOCK_M_triton, BLOCK_N_KV=BLOCK_N_KV_triton, BLOCK_DMODEL=BLOCK_DMODEL_triton,
-            N_CTX_KV=N_CTX_KV_triton
+            BLOCK_M=BLOCK_M_triton, BLOCK_N=BLOCK_N_triton, BLOCK_D=BLOCK_D_triton, KV_BLOCKS=kv_blocks
         )
         
         ctx.save_for_backward(q, k, v, o, p_raw_for_bwd, sig_p_raw, z_penalty, lse)
@@ -82,22 +81,26 @@ class CoALIBIAttention(torch.autograd.Function):
         dk = torch.zeros_like(k, dtype=torch.float32)
         dv = torch.zeros_like(v, dtype=torch.float32)
 
-        N_CTX_KV_triton = triton.next_power_of_2(seq_len_kv)
-        BLOCK_M_triton = 32 
-        BLOCK_N_KV_triton = 64 
+        BLOCK_M_triton = 32
+        BLOCK_N_triton = 64
         
-        if head_dim <= 16: BLOCK_DMODEL_triton = 16
-        elif head_dim <= 32: BLOCK_DMODEL_triton = 32
-        elif head_dim <= 64: BLOCK_DMODEL_triton = 64
-        elif head_dim <= 128: BLOCK_DMODEL_triton = 128
-        else: 
-            BLOCK_DMODEL_triton = 128 
-        if head_dim in [16,32,64,128]:
-            BLOCK_DMODEL_triton = head_dim
+        if head_dim <= 16: BLOCK_D_triton = 16
+        elif head_dim <= 32: BLOCK_D_triton = 32
+        elif head_dim <= 64: BLOCK_D_triton = 64
+        elif head_dim <= 128: BLOCK_D_triton = 128
+        else:
+            BLOCK_D_triton = 128
+        if head_dim in [16, 32, 64, 128]:
+            BLOCK_D_triton = head_dim
+
+        # Aliases for backward kernel expected names
+        BLOCK_N_KV_triton = BLOCK_N_triton
+        BLOCK_DMODEL_triton = BLOCK_D_triton
+        N_CTX_KV_triton = triton.next_power_of_2(seq_len_kv)
 
         grid = (triton.cdiv(seq_len_q, BLOCK_M_triton), batch_size * num_heads)
-        num_warps = 4 
-        if BLOCK_N_KV_triton >= 64 and BLOCK_DMODEL_triton >=64:
+        num_warps = 4
+        if BLOCK_N_KV_triton >= 64 and BLOCK_DMODEL_triton >= 64:
             num_warps = 8
 
         _co_alibi_bwd_kernel[grid](
@@ -118,8 +121,7 @@ class CoALIBIAttention(torch.autograd.Function):
             dv_stride_b=dv.stride(0), dv_stride_h=dv.stride(1), dv_stride_n=dv.stride(2), dv_stride_d=dv.stride(3),
             batch_size=batch_size, num_heads=num_heads, seq_len_q=seq_len_q, seq_len_kv=seq_len_kv, head_dim=head_dim,
             HAS_CAUSAL_MASK=causal, 
-            BLOCK_M=BLOCK_M_triton, BLOCK_N_KV=BLOCK_N_KV_triton, BLOCK_DMODEL=BLOCK_DMODEL_triton,
-            N_CTX_KV=N_CTX_KV_triton,
+            BLOCK_M=BLOCK_M_triton, BLOCK_N_KV=BLOCK_N_KV_triton, BLOCK_DMODEL=BLOCK_DMODEL_triton, N_CTX_KV=N_CTX_KV_triton,
             NUM_WARPS=num_warps
         )
         return dq, dk.to(k.dtype), dv.to(v.dtype), None, None

@@ -24,7 +24,8 @@ class CoALIBIPyTorch(torch.autograd.Function):
             # For sigmoid, ensure masked parts become ~0. If p_raw is used directly, large neg value is fine.
             # If a different masking for sigmoid is needed (e.g. if not causal, but still want some masking for sig)
             # that logic would go here. For CoALIBI as described, causal mask is primary for this stage.
-            p_raw_masked_for_sigmoid = p_raw.masked_fill(expanded_mask_bool, -1e9) # Use a large negative for sigmoid to be ~0
+            min_neg = -1e4  # safe for fp16 range
+            p_raw_masked_for_sigmoid = p_raw.masked_fill(expanded_mask_bool, min_neg)
         else:
             p_raw_masked_for_softmax = p_raw
             p_raw_masked_for_sigmoid = p_raw # No masking if not causal for sigmoid path
