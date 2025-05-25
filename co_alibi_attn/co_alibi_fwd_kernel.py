@@ -19,21 +19,20 @@ def _co_alibi_fwd_kernel(
     sig_p_raw_out_stride_b, sig_p_raw_out_stride_h, sig_p_raw_out_stride_m, sig_p_raw_out_stride_n,
     z_penalty_out_stride_b, z_penalty_out_stride_h, z_penalty_out_stride_m, z_penalty_out_stride_n,
     lse_out_stride_b, lse_out_stride_h, lse_out_stride_m,
-    # Meta-parameters (compile-time constants where annotated with tl.constexpr)
     batch_size: tl.constexpr, num_heads: tl.constexpr,
     seq_len_q: tl.constexpr, seq_len_kv: tl.constexpr, head_dim: tl.constexpr,
     HAS_CAUSAL_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, KV_BLOCKS: tl.constexpr
 ):
 
-    pid_m   = tl.program_id(axis=0)  # query block id
-    pid_bh  = tl.program_id(axis=1)  # combined batch/head id
+    pid_m   = tl.program_id(axis=0)
+    pid_bh  = tl.program_id(axis=1)
 
-    bid     = pid_bh // num_heads  # batch index
-    hid     = pid_bh %  num_heads  # head  index
+    bid     = pid_bh // num_heads
+    hid     = pid_bh %  num_heads
 
-    offs_m  = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)          # (BLOCK_M)
-    offs_d  = tl.arange(0, BLOCK_D)                             # (BLOCK_D)
+    offs_m  = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d  = tl.arange(0, BLOCK_D)
 
     q_ptrs = Q + bid * q_stride_b + hid * q_stride_h + offs_m[:, None] * q_stride_m + offs_d[None, :] * q_stride_k
     q_block = tl.load(q_ptrs, mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0).to(tl.float32)
@@ -46,19 +45,16 @@ def _co_alibi_fwd_kernel(
 
     for blk_idx_from_right in tl.static_range(KV_BLOCKS):
         start_k = (KV_BLOCKS - 1 - blk_idx_from_right) * BLOCK_N
-        offs_n = start_k + tl.arange(0, BLOCK_N)  # (BLOCK_N)
+        offs_n = start_k + tl.arange(0, BLOCK_N)
 
         k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[None, :] * k_stride_n + offs_d[:, None] * k_stride_k
         k_block = tl.load(k_ptrs, mask=(offs_n[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim), other=0.0)
 
-        # (BLOCK_N, head_dim)
         v_ptrs = V + bid * v_stride_b + hid * v_stride_h + offs_n[:, None] * v_stride_n + offs_d[None, :] * v_stride_d
         v_block = tl.load(v_ptrs, mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim), other=0.0)
 
-        # Compute raw scores    (BLOCK_M, BLOCK_N)
         p_raw_blk = tl.dot(q_block, k_block.to(tl.float32)) * sm_scale  # float32
 
-        # Causal mask (if enabled) : zero contribution where key position > query position
         if HAS_CAUSAL_MASK:
             causal_mask = offs_n[None, :] > offs_m[:, None]
             p_raw_masked_for_sigma = tl.where(causal_mask, -float('inf'), p_raw_blk)
@@ -110,7 +106,6 @@ def _co_alibi_fwd_kernel(
         tl.store(sig_ptr, sig_blk.to(Sig_P_raw_out.dtype.element_ty), mask=(offs_m[:, None] < seq_len_q) & key_valid_mask)
         tl.store(z_ptr, z_blk.to(Z_penalty_out.dtype.element_ty), mask=(offs_m[:, None] < seq_len_q) & key_valid_mask)
 
-    # Final output normalization
     o_blk = o_acc / (l_i + 1e-9)
 
     # Store output O

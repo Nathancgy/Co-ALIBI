@@ -106,12 +106,11 @@ def _co_alibi_bwd_kernel(
         sigma_prime_block = sig_p_raw_block_fp32 * (1.0 - sig_p_raw_block_fp32)
 
         c_local_prefix_sum_dp_adj = tl.cumsum(dp_adjusted_block, axis=1)
-        # Add the accumulated sum from previous blocks to each element
+
         c_block = c_prefix_sum_acc_row + c_local_prefix_sum_dp_adj
         
         dp_raw_block = dp_adjusted_block - sigma_prime_block * c_block
         if HAS_CAUSAL_MASK:
-            # Fixed: Use consistent causal condition
             dp_raw_block = tl.where(causal_cond_mask, 0.0, dp_raw_block)
         dp_raw_block = tl.where(offs_m_q[:, None] < seq_len_q, dp_raw_block, 0.0)
         
