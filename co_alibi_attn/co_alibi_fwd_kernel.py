@@ -25,7 +25,7 @@ def _co_alibi_fwd_kernel(
     HAS_CAUSAL_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, KV_BLOCKS: tl.constexpr
 ):
-    # Each program processes a BLOCK_M chunk of queries for one (batch, head)
+
     pid_m   = tl.program_id(axis=0)  # query block id
     pid_bh  = tl.program_id(axis=1)  # combined batch/head id
 
@@ -35,20 +35,16 @@ def _co_alibi_fwd_kernel(
     offs_m  = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)          # (BLOCK_M)
     offs_d  = tl.arange(0, BLOCK_D)                             # (BLOCK_D)
 
-    # Load query block  (BLOCK_M, head_dim)
     q_ptrs = Q + bid * q_stride_b + hid * q_stride_h + offs_m[:, None] * q_stride_m + offs_d[None, :] * q_stride_k
     q_block = tl.load(q_ptrs, mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0).to(tl.float32)
 
-    # State used across key streaming
-    m_i = tl.full((BLOCK_M, 1), -float('inf'), dtype=tl.float32)  # running max for stable softmax
-    l_i = tl.zeros((BLOCK_M, 1), dtype=tl.float32)               # running lse denominator (in exp space)
-    o_acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)       # output accumulator
+    m_i = tl.full((BLOCK_M, 1), -float('inf'), dtype=tl.float32) 
+    l_i = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
+    o_acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
 
-    z_running = tl.zeros((BLOCK_M, 1), dtype=tl.float32)         # suffix sigma sum already seen (to the right)
+    z_running = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
 
-    # Process key / value blocks RIGHT-TO-LEFT so that suffix sums can be updated on the fly
     for blk_idx_from_right in tl.static_range(KV_BLOCKS):
-        # Convert from right-to-left index to actual starting key position in [0, seq_len_kv)
         start_k = (KV_BLOCKS - 1 - blk_idx_from_right) * BLOCK_N
         offs_n = start_k + tl.arange(0, BLOCK_N)  # (BLOCK_N)
 
@@ -73,18 +69,17 @@ def _co_alibi_fwd_kernel(
         if HAS_CAUSAL_MASK:
             sig_blk = tl.where(causal_mask, 0.0, sig_blk)
 
-        # --- Compute Z_penalty block via running suffix sum ---
         z_blk = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        running = z_running                # suffix sum from keys to the right (BLOCK_M,1)
+        running = z_running 
         cols = tl.arange(0, BLOCK_N)
         for ii in tl.static_range(BLOCK_N):
-            col_idx = BLOCK_N - 1 - ii      # visit columns right→left
-            col_mask = (cols == col_idx).to(tl.int1)  # (BLOCK_N) boolean
-            # Inclusive suffix-sum: first add σ(p_tτ) then write running.
+            col_idx = BLOCK_N - 1 - ii
+            col_mask = (cols == col_idx).to(tl.int1)
+
             s_increment = tl.sum(sig_blk * col_mask[None, :], axis=1)[:, None]
             running = running + s_increment
             z_blk = tl.where(col_mask[None, :], running, z_blk)
-        z_running = running  # update for next (left) block
+        z_running = running
 
         # p_adjusted
         p_adj_blk = p_raw_blk - z_blk
@@ -97,19 +92,16 @@ def _co_alibi_fwd_kernel(
         l_i = l_i * exp_diff + tl.sum(tl.exp(p_adj_blk - m_i_new), axis=1)[:, None]
         m_i = m_i_new
 
-        # Compute normalized probs for this block (in fp16 if input dtype is fp16)
         p_scores_blk = tl.exp(p_adj_blk - m_i)
         if HAS_CAUSAL_MASK:
             p_scores_blk = tl.where(causal_mask, 0.0, p_scores_blk)
-        # Apply key length mask
+
         key_valid_mask = offs_n[None, :] < seq_len_kv
         p_scores_blk = tl.where(key_valid_mask, p_scores_blk, 0.0)
 
         # Accumulate output
         o_acc = o_acc * exp_diff + tl.dot(p_scores_blk, v_block.to(tl.float32))
 
-        # ---------------- Store intermediates for backward ----------------
-        # Global memory pointers
         p_raw_out_ptr = P_raw_out + bid * p_raw_out_stride_b + hid * p_raw_out_stride_h + offs_m[:, None] * p_raw_out_stride_m + offs_n[None, :] * p_raw_out_stride_n
         sig_ptr = Sig_P_raw_out + bid * sig_p_raw_out_stride_b + hid * sig_p_raw_out_stride_h + offs_m[:, None] * sig_p_raw_out_stride_m + offs_n[None, :] * sig_p_raw_out_stride_n
         z_ptr = Z_penalty_out + bid * z_penalty_out_stride_b + hid * z_penalty_out_stride_h + offs_m[:, None] * z_penalty_out_stride_m + offs_n[None, :] * z_penalty_out_stride_n

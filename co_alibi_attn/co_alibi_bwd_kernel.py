@@ -3,16 +3,13 @@ import triton.language as tl
 
 @triton.jit
 def _sigmoid(x):
-    # Helper for sigma_prime calculation if needed, or use P_raw_in and Sig_P_raw_in directly
     return 1 / (1 + tl.exp(-x))
 
 @triton.jit
 def _co_alibi_bwd_kernel(
-    # Inputs from forward pass & autograd context
     Q, K, V, sm_scale, causal_mask_value, # Original inputs
     P_raw_in, Sig_P_raw_in, Z_penalty_in, LSE_in, # Saved intermediates from fwd
-    DO, # Gradient of loss w.r.t. output O
-    # Outputs (gradients to compute)
+    DO, 
     DQ, DK, DV,
     # Strides for all tensors
     q_stride_b, q_stride_h, q_stride_m, q_stride_k,
@@ -30,18 +27,17 @@ def _co_alibi_bwd_kernel(
     batch_size, num_heads, seq_len_q, seq_len_kv, head_dim,
     HAS_CAUSAL_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N_KV: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
-    N_CTX_KV: tl.constexpr, # Max context length for SRAM buffers (power of 2 >= seq_len_kv)
+    N_CTX_KV: tl.constexpr,
     NUM_WARPS: tl.constexpr
 ):
-    pid_m = tl.program_id(0)  # Operates on a block of BLOCK_M queries
-    pid_bh = tl.program_id(1) # Batch and head index
+    pid_m = tl.program_id(0) 
+    pid_bh = tl.program_id(1) 
 
     pid_b = pid_bh // num_heads
     pid_h = pid_bh % num_heads
 
-    # Offsets for the current query block
-    offs_m_q = pid_m * BLOCK_M + tl.arange(0, BLOCK_M) # Query indices [0, BLOCK_M-1] relative to pid_m start
-    offs_d = tl.arange(0, BLOCK_DMODEL) # Head dimension indices
+    offs_m_q = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
 
     # --- Load Q_block and DO_block (for the current BLOCK_M queries) --- 
     q_ptrs = Q + pid_b * q_stride_b + pid_h * q_stride_h + \
@@ -52,23 +48,16 @@ def _co_alibi_bwd_kernel(
               offs_m_q[:, None] * do_stride_m + offs_d[None, :] * do_stride_d
     do_block = tl.load(do_ptrs, mask=(offs_m_q[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0)
 
-    # --- Load LSE for the current query block --- (B, H, M)
     lse_ptrs = LSE_in + pid_b * lse_in_stride_b + pid_h * lse_in_stride_h + offs_m_q * lse_in_stride_m
     lse_row = tl.load(lse_ptrs, mask=offs_m_q < seq_len_q, other=0.0).to(tl.float32)[:, None] # Reshape to (BLOCK_M, 1) for broadcasting
 
-    # --- Initialize dQ accumulator in SRAM --- (BLOCK_M, BLOCK_DMODEL)
     dq_acc = tl.zeros((BLOCK_M, BLOCK_DMODEL), dtype=tl.float32)
-    
-    # --- SRAM buffer for dp_adjusted_row prefix sum across key blocks ---
-    # C_tμ = sum_{α=0 to μ} dp'_tα. This needs to accumulate across iterations of key blocks.
-    # For each query row in BLOCK_M, we need a running sum of dp_adjusted elements.
     c_prefix_sum_acc_row = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
 
     # --- Loop over key/value blocks (dim N_KV) ---
     for start_n_kv in range(0, seq_len_kv, BLOCK_N_KV):
-        offs_n_kv = start_n_kv + tl.arange(0, BLOCK_N_KV) # Key indices for this block
+        offs_n_kv = start_n_kv + tl.arange(0, BLOCK_N_KV)
 
-        # --- Load K_block, V_block --- 
         k_ptrs = K + pid_b * k_stride_b + pid_h * k_stride_h + \
                  offs_n_kv[None, :] * k_stride_n + offs_d[:, None] * k_stride_k # K is (D, N)
         k_block = tl.load(k_ptrs, mask=(offs_n_kv[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim), other=0.0) # (DMODEL, BLOCK_N_KV)
@@ -77,8 +66,6 @@ def _co_alibi_bwd_kernel(
                  offs_n_kv[:, None] * v_stride_n + offs_d[None, :] * v_stride_d # V is (N, D)
         v_block = tl.load(v_ptrs, mask=(offs_n_kv[:, None] < seq_len_kv) & (offs_d[None,:] < head_dim), other=0.0) # (BLOCK_N_KV, DMODEL)
 
-        # --- Load P_raw, Sig_P_raw, Z_penalty for the current Q_block and K_block --- 
-        # Shapes: (BLOCK_M, BLOCK_N_KV)
         p_raw_ptrs = P_raw_in + pid_b * p_raw_in_stride_b + pid_h * p_raw_in_stride_h + \
                      offs_m_q[:, None] * p_raw_in_stride_m + offs_n_kv[None, :] * p_raw_in_stride_n
         p_raw_block = tl.load(p_raw_ptrs, mask=(offs_m_q[:, None] < seq_len_q) & (offs_n_kv[None, :] < seq_len_kv), other=0.0)
@@ -91,48 +78,33 @@ def _co_alibi_bwd_kernel(
                          offs_m_q[:, None] * z_penalty_in_stride_m + offs_n_kv[None, :] * z_penalty_in_stride_n
         z_penalty_block = tl.load(z_penalty_ptrs, mask=(offs_m_q[:, None] < seq_len_q) & (offs_n_kv[None, :] < seq_len_kv), other=0.0)
 
-        # --- Step 1 (from math): Recompute S_block (Attention Probabilities) ---
-        # p_adjusted = p_raw - z_penalty
         p_adjusted_block = p_raw_block - z_penalty_block
 
-        # Define causal condition once for this scope if HAS_CAUSAL_MASK
-        causal_cond_mask = offs_m_q[:, None] < offs_n_kv[None, :] # True if key is future to query, so mask
+        causal_cond_mask = offs_m_q[:, None] < offs_n_kv[None, :]
 
         if HAS_CAUSAL_MASK:
-            # causal_cond was here in the original file. Use causal_cond_mask
             p_adjusted_block = tl.where(causal_cond_mask, causal_mask_value, p_adjusted_block)
         
-        # s = exp(p_adjusted - lse)
-        _s_block_fp32 = tl.exp(p_adjusted_block - lse_row) # lse_row is (BLOCK_M, 1), compute in fp32
-        s_block = _s_block_fp32.to(Q.dtype.element_ty)   # Cast to Q's dtype (e.g., fp16)
+        _s_block_fp32 = tl.exp(p_adjusted_block - lse_row)
+        s_block = _s_block_fp32.to(Q.dtype.element_ty)
 
         if HAS_CAUSAL_MASK:
             s_block = tl.where(causal_cond_mask, 0.0, s_block)
-        # Mask S for queries out of bounds (e.g. padding queries)
         s_block = tl.where(offs_m_q[:, None] < seq_len_q, s_block, 0.0)
 
-        # --- Step 2 (from math): Calculate dS_block = DO @ V.T --- (BLOCK_M, BLOCK_N_KV)
         ds_block = tl.dot(do_block.to(tl.float32), tl.trans(v_block.to(tl.float32)))
 
-        # --- Step 3 (from math): Calculate dP_adjusted_block (Softmax Backward) ---
-        # dP'_tτ = S_tτ * (dS_tτ - sum_α dS_tα * S_tα)
-        # sum_ds_s needs to be row-wise sum over N_KV dim: (BLOCK_M, 1)
-        sum_ds_s = tl.sum(ds_block * s_block.to(tl.float32), axis=1)[:, None] # Keep dim for broadcasting, use s_block as fp32 for product
-        dp_adjusted_block = s_block.to(tl.float32) * (ds_block - sum_ds_s) # use s_block as fp32 for product
+        sum_ds_s = tl.sum(ds_block * s_block.to(tl.float32), axis=1)[:, None]
+        dp_adjusted_block = s_block.to(tl.float32) * (ds_block - sum_ds_s)
         
         if HAS_CAUSAL_MASK:
             # Use the already defined causal_cond_mask
             dp_adjusted_block = tl.where(causal_cond_mask, 0.0, dp_adjusted_block)
         dp_adjusted_block = tl.where(offs_m_q[:, None] < seq_len_q, dp_adjusted_block, 0.0)
 
-        # --- Step 4 & 5 (from math): Calculate dP_raw_block via Penalty --- 
-        # dP_raw_tμ = dP'_tμ - σ'(P_raw_tμ) * C_tμ
-        # σ'(P_raw) = σ(P_raw) * (1 - σ(P_raw))
         sig_p_raw_block_fp32 = sig_p_raw_block.to(tl.float32)
         sigma_prime_block = sig_p_raw_block_fp32 * (1.0 - sig_p_raw_block_fp32)
 
-        # Calculate C_tμ = prefix_sum(dP'_tα) for the current block
-        # This needs to account for accumulation from previous blocks
         c_local_prefix_sum_dp_adj = tl.cumsum(dp_adjusted_block, axis=1)
         # Add the accumulated sum from previous blocks to each element
         c_block = c_prefix_sum_acc_row + c_local_prefix_sum_dp_adj
@@ -143,33 +115,20 @@ def _co_alibi_bwd_kernel(
             dp_raw_block = tl.where(causal_cond_mask, 0.0, dp_raw_block)
         dp_raw_block = tl.where(offs_m_q[:, None] < seq_len_q, dp_raw_block, 0.0)
         
-        # Update the running prefix sum for the next iteration of key blocks
-        # Add the sum of the current full dp_adjusted_block row to the accumulator for that row
         c_prefix_sum_acc_row += tl.sum(dp_adjusted_block, axis=1)[:, None]
 
-        # --- Step 1 (from math, re-stated): Calculate dV contribution --- (BLOCK_N_KV, DMODEL)
-        # dV_contrib = S_block.T @ DO_block
-        # S_block is (BLOCK_M, BLOCK_N_KV), DO_block is (BLOCK_M, DMODEL)
-        # Keep math in fp32 for accuracy, cast only when writing
         dv_contrib = tl.dot(tl.trans(s_block.to(tl.float32)), do_block.to(tl.float32))
         dv_ptrs = DV + pid_b * dv_stride_b + pid_h * dv_stride_h + \
                   offs_n_kv[:, None] * dv_stride_n + offs_d[None, :] * dv_stride_d
         tl.atomic_add(dv_ptrs, dv_contrib.to(DV.dtype.element_ty), mask=(offs_n_kv[:, None] < seq_len_kv) & (offs_d[None,:] < head_dim))
 
-        # --- Step 6 (from math): Calculate dK contribution ---
-        # dK_contrib = (dP_raw_block * sm_scale).T @ Q_block
-        # dP_raw_block is (BLOCK_M, BLOCK_N_KV), Q_block is (BLOCK_M, DMODEL)
         dk_contrib = tl.dot(tl.trans(dp_raw_block * sm_scale), q_block.to(tl.float32))
         dk_ptrs = DK + pid_b * dk_stride_b + pid_h * dk_stride_h + \
                   offs_n_kv[:, None] * dk_stride_n + offs_d[None, :] * dk_stride_k
         tl.atomic_add(dk_ptrs, dk_contrib.to(DK.dtype.element_ty), mask=(offs_n_kv[:, None] < seq_len_kv) & (offs_d[None,:] < head_dim))
         
-        # --- Step 6 (from math): Accumulate dQ contribution ---
-        # dQ_acc += (dP_raw_block * sm_scale) @ K_block.T
-        # dP_raw_block is (BLOCK_M, BLOCK_N_KV), K_block is (DMODEL, BLOCK_N_KV)
         dq_acc += tl.dot(dp_raw_block * sm_scale, tl.trans(k_block.to(tl.float32)))
 
-    # --- Store final dQ --- (BLOCK_M, DMODEL)
     dq_ptrs = DQ + pid_b * dq_stride_b + pid_h * dq_stride_h + \
               offs_m_q[:, None] * dq_stride_m + offs_d[None, :] * dq_stride_k
     tl.store(dq_ptrs, dq_acc.to(DQ.dtype.element_ty), \

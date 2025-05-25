@@ -140,45 +140,18 @@ class CoALIBI(torch.autograd.Function):
         # Mask out gradients for positions that were causally masked
         dp_adjusted = dp_adjusted.masked_fill(causal_mask_bool, 0.0)
 
-        # Step 4 & 5: Gradient w.r.t. Raw Scores P_raw (dp_raw) via Penalty
-        # dp_tμ = dp'_tμ - σ'(p_tμ) * C_tμ
-        # where C_tμ = sum_{α=1 to μ} dp'_tα (prefix sum of dp_adjusted for query t)
-        # And σ'(p) = σ(p) * (1 - σ(p))
-
-        # sig_p_raw was saved as σ(p_raw)
-        # Note: p_raw used for sigma_prime was already masked in forward.
-        # So sig_p_raw for masked positions is 0. sigma_prime will also be 0.
         sigma_prime_p_raw = sig_p_raw * (1.0 - sig_p_raw) # σ'(p_raw_tμ)
 
-        # Prefix sum for dp_adjusted: C_tμ
-        # For each query row (dim N_q), cumsum over key columns (dim N_k)
         c_prefix_sum_dp_prime = torch.cumsum(dp_adjusted, dim=-1)
 
-        # Gradient contribution from the penalty path
-        # dL/dp_raw (via Z) = sum_{alpha<=mu} [ dL/dp'_alpha * (dp'_alpha/dZ_alpha) * (dZ_alpha/dp_raw_mu) ]
-        # dL/dp'_alpha * (-1) * sigma'(p_raw_mu)
         dp_raw_from_penalty_path = -sigma_prime_p_raw * c_prefix_sum_dp_prime
         
-        # Total dp_raw: gradient from p_adjusted directly + gradient from penalty path
-        # dL/dp_raw_mu (direct) = dL/dp'_mu * (dp'_mu / dp_raw_mu) = dL/dp'_mu * 1
         dp_raw = dp_adjusted + dp_raw_from_penalty_path
         
         # Mask out gradients again for causally masked positions
         dp_raw = dp_raw.masked_fill(causal_mask_bool, 0.0)
 
-        # Step 6: Gradients w.r.t. Q and K
-        # dp_raw is dL/dp_tτ (shape: B, H, N_q, N_k)
-        # dQ_t = scale_factor * sum_τ dp_tτ * K_τ
-        # dq should be (B, H, N_q, D_h)
-        # k is (B, H, N_k, D_h)
         dq = torch.einsum('bhij,bhjd->bhid', dp_raw, k) * scale_factor
-
-        # dK_τ = scale_factor * sum_t dp_tτ * Q_t
-        # dk should be (B, H, N_k, D_h)
-        # q is (B, H, N_q, D_h)
-        # Formula: dK_τ = scale_factor * sum_t dp_tτ * Q_t
-        # dp_raw[b,h,t,τ] (t=Nq, τ=Nk), q[b,h,t,d] (t=Nq, d=Dh) -> dk[b,h,τ,d]
-        # einsum: 'bhij,bhid->bhjd' (i=Nq for dp_raw&q, j=Nk for dp_raw, d=Dh for q)
         dk = torch.einsum('bhij,bhid->bhjd', dp_raw, q) * scale_factor
         
         return dq, dk, dv, None # For scale_factor if it doesn't require grad
