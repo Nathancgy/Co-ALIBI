@@ -86,7 +86,6 @@ def main():
     ITERS  = 100
 
     def time_fn(fn, *args):
-        # warm-up
         for _ in range(WARMUP):
             fn(*args)
         torch.cuda.synchronize()

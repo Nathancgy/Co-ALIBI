@@ -32,7 +32,7 @@ def _co_alibi_fwd_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_D)
     q_ptrs = Q + bid * q_stride_b + hid * q_stride_h + offs_m[:, None] * q_stride_m + offs_d[None, :] * q_stride_k
-    q_block = tl.load(q_ptrs, mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0).to(tl.float32)
+    q_block = tl.load(q_ptrs, mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0)
 
     m_i = tl.full((BLOCK_M, 1), -float('inf'), dtype=tl.float32) 
     l_i = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
@@ -48,7 +48,7 @@ def _co_alibi_fwd_kernel(
         v_ptrs = V + bid * v_stride_b + hid * v_stride_h + offs_n[:, None] * v_stride_n + offs_d[None, :] * v_stride_d
         v_block = tl.load(v_ptrs, mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim), other=0.0)
 
-        p_raw_blk = tl.dot(q_block, k_block.to(tl.float32)) * sm_scale
+        p_raw_blk = tl.dot(q_block, k_block) * sm_scale
         key_valid_mask = offs_n[None, :] < seq_len_kv
         p_raw_masked_for_sigma_blk = p_raw_blk 
         if HAS_CAUSAL_MASK:
@@ -60,18 +60,11 @@ def _co_alibi_fwd_kernel(
         if HAS_CAUSAL_MASK:
             sig_blk = tl.where(causal_mask, 0.0, sig_blk)
         sig_blk = tl.where(key_valid_mask, sig_blk, 0.0)
-        
-        current_block_z_sum = tl.zeros((BLOCK_M, 1), dtype=tl.float32) 
-        temp_z_blk = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32) 
-        for ii in tl.static_range(BLOCK_N):
-            col_idx_in_block = BLOCK_N - 1 - ii 
-            col_mask = (tl.arange(0, BLOCK_N) == col_idx_in_block)
-            s_increment_col = tl.sum(sig_blk * col_mask[None, :], axis=1)[:, None] 
-            current_block_z_sum += s_increment_col
-            val_for_z_col = current_block_z_sum + z_running 
-            temp_z_blk = tl.where(col_mask[None, :], val_for_z_col, temp_z_blk)
-        z_blk = temp_z_blk 
-        z_running += current_block_z_sum 
+
+        prefix_sum = tl.cumsum(sig_blk, 1)
+        row_total = tl.sum(sig_blk, 1)[:, None]
+        z_blk = row_total - prefix_sum + sig_blk + z_running
+        z_running += row_total
 
         p_adj_blk = p_raw_blk - z_blk
         if HAS_CAUSAL_MASK:
@@ -88,10 +81,7 @@ def _co_alibi_fwd_kernel(
         l_i = l_i * exp_diff + tl.sum(exp_p_adj_minus_m_new, axis=1)[:, None]
         m_i = m_i_new 
         
-        p_scores_blk = tl.exp(p_adj_blk - m_i) 
-        if HAS_CAUSAL_MASK: 
-            p_scores_blk = tl.where(causal_mask, 0.0, p_scores_blk) 
-        p_scores_blk = tl.where(key_valid_mask_for_scores, p_scores_blk, 0.0)
+        p_scores_blk = exp_p_adj_minus_m_new
         o_acc = o_acc * exp_diff + tl.dot(p_scores_blk.to(v_block.dtype), v_block) 
 
         # --- Debug ---
