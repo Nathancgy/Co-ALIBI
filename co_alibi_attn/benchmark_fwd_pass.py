@@ -69,7 +69,7 @@ def main():
 
     o_ref = ref_forward(q, k, v, scale_factor=scale, return_intermediates=False, verbose=False)
 
-    print("\nRunning Triton forward (debug mode)...")
+    print("\nRunning Triton forward...")
     o_tri = co_alibi_attention(q, k, v, causal=True, sm_scale=scale)
 
     print("\n--- Numerical comparison ---")
