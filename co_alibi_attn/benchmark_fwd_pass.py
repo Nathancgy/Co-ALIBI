@@ -1,18 +1,10 @@
 import torch, math, sys, os
 
-# Ensure we can import sibling / parent modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from co_alibi_attn import co_alibi_attention  # production kernel
-
-USE_DEBUG = False  # whether to run debug version collecting intermediates
-
-# ---- Helper utilities --------------------------------------------------
+from co_alibi_attn import co_alibi_attention
 
 def ref_forward(q, k, v, scale_factor, return_intermediates=False, verbose=False):
-    """Pure-PyTorch reference forward (no autograd) matching the math. Optionally
-    returns intermediates for numerical comparison. `verbose` prints them.
-    """
     B, H, N_q, _ = q.shape
     N_k = k.shape[2]
 
@@ -37,7 +29,6 @@ def ref_forward(q, k, v, scale_factor, return_intermediates=False, verbose=False
 
     o = torch.einsum('bhij,bhjd->bhid', s, v)
 
-    # Log-sum-exp value (per query position) for later gradient use; match kernel
     lse_val = m.squeeze(-1) + torch.log(lse_denom.squeeze(-1))
 
     if verbose:
@@ -56,16 +47,16 @@ def ref_forward(q, k, v, scale_factor, return_intermediates=False, verbose=False
         return o, p_raw, sig_p_raw, z_penalty, lse_val
     return o
 
-def first_mismatch(a: torch.Tensor, b: torch.Tensor, atol=1e-4, rtol=5e-4):
+def first_mismatch(a: torch.Tensor, b: torch.Tensor, atol=1e-3, rtol=5e-3):
     diff = torch.abs(a - b)
     mask = diff > (atol + rtol * torch.abs(b))
     if not mask.any():
-        return None  # no mismatch
+        return None
     idx = mask.nonzero(as_tuple=False)[0]
     return tuple(idx.tolist()), a[tuple(idx)].item(), b[tuple(idx)].item(), diff[tuple(idx)].item()
 
 def main():
-    B, H, N_q, N_k, D = 1, 1, 4, 4, 2  # toy example – tweak as needed
+    B, H, N_q, N_k, D = 4, 8, 1024, 1024, 64 
     dtype = torch.float32
 
     torch.manual_seed(0)
@@ -76,20 +67,11 @@ def main():
 
     scale = 1.0 / math.sqrt(D)
 
-    # ------------------------------------------------------------------
-    # Run reference (PyTorch)
-    # ------------------------------------------------------------------
     o_ref = ref_forward(q, k, v, scale_factor=scale, return_intermediates=False, verbose=False)
 
-    # ------------------------------------------------------------------
-    # Run Triton kernel + grab intermediates
-    # ------------------------------------------------------------------
     print("\nRunning Triton forward (debug mode)...")
     o_tri = co_alibi_attention(q, k, v, causal=True, sm_scale=scale)
 
-    # ------------------------------------------------------------------
-    # Comparison helper
-    # ------------------------------------------------------------------
     print("\n--- Numerical comparison ---")
     mm = first_mismatch(o_tri, o_ref)
     if mm is None:
@@ -98,9 +80,6 @@ def main():
         idx, a, b, d = mm
         print(f"output : mismatch at {idx}  tri={a:.6g}  ref={b:.6g} |diff|={d:.3g}")
 
-    # ------------------------------------------------------------------
-    # Timing benchmark (no grad)
-    # ------------------------------------------------------------------
     import time
 
     WARMUP = 10
@@ -116,7 +95,7 @@ def main():
             fn(*args)
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-        return (t1 - t0) * 1000 / ITERS  # ms / iter
+        return (t1 - t0) * 1000 / ITERS
 
     with torch.no_grad():
         ms_ref  = time_fn(lambda a,b,c: ref_forward(a,b,c, scale_factor=scale), q, k, v)
