@@ -2,8 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
-from .co_alibi_fwd_kernel import _co_alibi_fwd_kernel
-from .co_alibi_bwd_kernel import _co_alibi_bwd_kernel
+from co_alibi_fwd_kernel import _co_alibi_fwd_kernel
+from co_alibi_bwd_kernel import _co_alibi_bwd_kernel
 
 class CoALIBIAttention(torch.autograd.Function):
     @staticmethod
@@ -125,6 +125,71 @@ class CoALIBIAttention(torch.autograd.Function):
             NUM_WARPS=num_warps
         )
         return dq, dk.to(k.dtype), dv.to(v.dtype), None, None
+
+
+def _run_triton_fwd_kernel(q, k, v, causal: bool, sm_scale: float):
+    """Utility that launches the Triton forward kernel and returns
+    (o, p_raw, sig_p_raw, z_penalty, lse) but does *not* set up autograd.
+    Purely for debugging / numerical checking purposes.
+    """
+    batch_size, num_heads, seq_len_q, head_dim = q.shape
+    seq_len_kv = k.shape[2]
+
+    o = torch.empty_like(q)
+
+    p_raw = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=q.dtype)
+    sig_p_raw = torch.empty_like(p_raw)
+    z_penalty = torch.empty_like(p_raw)
+    lse = torch.empty((batch_size, num_heads, seq_len_q), device=q.device, dtype=torch.float32)
+
+    causal_mask_value_fwd = -torch.finfo(torch.float32).max
+
+    BLOCK_M_triton = 32
+    BLOCK_N_triton = 64
+    if head_dim <= 16:
+        BLOCK_D_triton = 16
+    elif head_dim <= 32:
+        BLOCK_D_triton = 32
+    elif head_dim <= 64:
+        BLOCK_D_triton = 64
+    elif head_dim <= 128:
+        BLOCK_D_triton = 128
+    else:
+        BLOCK_D_triton = 128
+    if head_dim in [16, 32, 64, 128]:
+        BLOCK_D_triton = head_dim
+
+    kv_blocks = (seq_len_kv + BLOCK_N_triton - 1) // BLOCK_N_triton
+    grid = (triton.cdiv(seq_len_q, BLOCK_M_triton), batch_size * num_heads)
+
+    _co_alibi_fwd_kernel[grid](
+        Q=q, K=k, V=v, sm_scale=sm_scale, causal_mask_value=causal_mask_value_fwd,
+        P_raw_out=p_raw, Sig_P_raw_out=sig_p_raw, Z_penalty_out=z_penalty, LSE_out=lse,
+        Out=o,
+        q_stride_b=q.stride(0), q_stride_h=q.stride(1), q_stride_m=q.stride(2), q_stride_k=q.stride(3),
+        k_stride_b=k.stride(0), k_stride_h=k.stride(1), k_stride_n=k.stride(2), k_stride_k=k.stride(3),
+        v_stride_b=v.stride(0), v_stride_h=v.stride(1), v_stride_n=v.stride(2), v_stride_d=v.stride(3),
+        out_stride_b=o.stride(0), out_stride_h=o.stride(1), out_stride_m=o.stride(2), out_stride_d=o.stride(3),
+        p_raw_out_stride_b=p_raw.stride(0), p_raw_out_stride_h=p_raw.stride(1), p_raw_out_stride_m=p_raw.stride(2), p_raw_out_stride_n=p_raw.stride(3),
+        sig_p_raw_out_stride_b=sig_p_raw.stride(0), sig_p_raw_out_stride_h=sig_p_raw.stride(1), sig_p_raw_out_stride_m=sig_p_raw.stride(2), sig_p_raw_out_stride_n=sig_p_raw.stride(3),
+        z_penalty_out_stride_b=z_penalty.stride(0), z_penalty_out_stride_h=z_penalty.stride(1), z_penalty_out_stride_m=z_penalty.stride(2), z_penalty_out_stride_n=z_penalty.stride(3),
+        lse_out_stride_b=lse.stride(0), lse_out_stride_h=lse.stride(1), lse_out_stride_m=lse.stride(2),
+        batch_size=batch_size, num_heads=num_heads, seq_len_q=seq_len_q, seq_len_kv=seq_len_kv, head_dim=head_dim,
+        HAS_CAUSAL_MASK=causal,
+        BLOCK_M=BLOCK_M_triton, BLOCK_N=BLOCK_N_triton, BLOCK_D=BLOCK_D_triton, KV_BLOCKS=kv_blocks
+    )
+    return o, p_raw, sig_p_raw, z_penalty, lse
+
+
+def co_alibi_attention_debug(q, k, v, causal=True, sm_scale=None):
+    """Run Triton forward pass and return all intermediates for numerical debugging.
+    This skips autograd and therefore should *not* be used in training – just analysis.
+    Returns: o, p_raw, sig_p_raw, z_penalty, lse (same dtypes as in kernel).
+    """
+    if sm_scale is None:
+        sm_scale = 1.0 / (q.shape[-1] ** 0.5)
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    return _run_triton_fwd_kernel(q, k, v, causal, sm_scale)
 
 
 def co_alibi_attention(q, k, v, causal=True, sm_scale=None):
