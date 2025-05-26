@@ -1,6 +1,6 @@
 import torch
-import triton
-import triton.language as tl
+import triton # type: ignore[import-unresolved]
+import triton.language as tl # type: ignore[import-unresolved]
 
 from co_alibi_fwd_kernel import _co_alibi_fwd_kernel
 from co_alibi_bwd_kernel import _co_alibi_bwd_kernel
