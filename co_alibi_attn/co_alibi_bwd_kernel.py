@@ -3,132 +3,167 @@ import triton.language as tl # type: ignore[import-unresolved]
 
 @triton.jit
 def _sigmoid(x):
-    return 1 / (1 + tl.exp(-x))
+    return 1.0 / (1.0 + tl.exp(-x))
 
 @triton.jit
 def _co_alibi_bwd_kernel(
-    Q, K, V, sm_scale, causal_mask_value, # Original inputs
-    P_raw_in, Sig_P_raw_in, Z_penalty_in, LSE_in, # Saved intermediates from fwd
-    DO, 
+    Q, K, V, sm_scale, causal_mask_value,
+    LSE_in,  # (B, H, M)  float32
+    DO,       # upstream grad (B, H, M, D)
     DQ, DK, DV,
-    # Strides for all tensors
+    # Strides ------------------------------------------------------------------
     q_stride_b, q_stride_h, q_stride_m, q_stride_k,
     k_stride_b, k_stride_h, k_stride_n, k_stride_k,
     v_stride_b, v_stride_h, v_stride_n, v_stride_d,
-    p_raw_in_stride_b, p_raw_in_stride_h, p_raw_in_stride_m, p_raw_in_stride_n,
-    sig_p_raw_in_stride_b, sig_p_raw_in_stride_h, sig_p_raw_in_stride_m, sig_p_raw_in_stride_n,
-    z_penalty_in_stride_b, z_penalty_in_stride_h, z_penalty_in_stride_m, z_penalty_in_stride_n,
     lse_in_stride_b, lse_in_stride_h, lse_in_stride_m,
     do_stride_b, do_stride_h, do_stride_m, do_stride_d,
     dq_stride_b, dq_stride_h, dq_stride_m, dq_stride_k,
     dk_stride_b, dk_stride_h, dk_stride_n, dk_stride_k,
     dv_stride_b, dv_stride_h, dv_stride_n, dv_stride_d,
-    # Meta-parameters
+    # Meta ---------------------------------------------------------------------
     batch_size, num_heads, seq_len_q, seq_len_kv, head_dim,
     HAS_CAUSAL_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N_KV: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
-    N_CTX_KV: tl.constexpr,
-    NUM_WARPS: tl.constexpr
+    NUM_WARPS: tl.constexpr,
 ):
-    pid_m = tl.program_id(0) 
-    pid_bh = tl.program_id(1) 
+    """Backward pass with recomputation, memory-free.
+    * BLOCK_M      – rows (queries) per program-id (threadblock)
+    * BLOCK_N_KV   – columns (keys/values) processed per iteration
+    * BLOCK_DMODEL – head dim tile loaded at once (should equal head_dim)
+    The algorithm follows Sec.-B of the Co-ALIBI note.
+    """
 
-    pid_b = pid_bh // num_heads
-    pid_h = pid_bh % num_heads
+    # -------------------- program ids ----------------------------------------
+    pid_m  = tl.program_id(axis=0)                       # along queries
+    pid_bh = tl.program_id(axis=1)                       # batch*head
+    bid    = pid_bh // num_heads
+    hid    = pid_bh % num_heads
 
-    offs_m_q = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_DMODEL)
+    # -------------------- offsets -------------------------------------------
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)     # (M,)
+    offs_d = tl.arange(0, BLOCK_DMODEL)                  # (D,)
 
-    # --- Load Q_block and DO_block (for the current BLOCK_M queries) --- 
-    q_ptrs = Q + pid_b * q_stride_b + pid_h * q_stride_h + \
-             offs_m_q[:, None] * q_stride_m + offs_d[None, :] * q_stride_k
-    q_block = tl.load(q_ptrs, mask=(offs_m_q[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0)
+    # -------------------- load Q, dO ----------------------------------------
+    q_ptrs = Q + bid * q_stride_b + hid * q_stride_h + offs_m[:, None] * q_stride_m + offs_d[None, :] * q_stride_k
+    q_blk  = tl.load(q_ptrs, mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0)
 
-    do_ptrs = DO + pid_b * do_stride_b + pid_h * do_stride_h + \
-              offs_m_q[:, None] * do_stride_m + offs_d[None, :] * do_stride_d
-    do_block = tl.load(do_ptrs, mask=(offs_m_q[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0)
+    do_ptrs = DO + bid * do_stride_b + hid * do_stride_h + offs_m[:, None] * do_stride_m + offs_d[None, :] * do_stride_d
+    do_blk  = tl.load(do_ptrs, mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0)
 
-    lse_ptrs = LSE_in + pid_b * lse_in_stride_b + pid_h * lse_in_stride_h + offs_m_q * lse_in_stride_m
-    lse_row = tl.load(lse_ptrs, mask=offs_m_q < seq_len_q, other=0.0).to(tl.float32)[:, None] # Reshape to (BLOCK_M, 1) for broadcasting
+    # LSE row (stored as float32) ------------------------------------------------
+    lse_ptrs = LSE_in + bid * lse_in_stride_b + hid * lse_in_stride_h + offs_m * lse_in_stride_m
+    lse_row  = tl.load(lse_ptrs, mask=offs_m < seq_len_q, other=0.0)[:, None]
 
+    # ---------------- accumulators -------------------------------------------
     dq_acc = tl.zeros((BLOCK_M, BLOCK_DMODEL), dtype=tl.float32)
-    c_prefix_sum_acc_row = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
 
-    # --- Loop over key/value blocks (dim N_KV) ---
-    for start_n_kv in range(0, seq_len_kv, BLOCK_N_KV):
-        offs_n_kv = start_n_kv + tl.arange(0, BLOCK_N_KV)
+    # For DK & DV we use atomics (they are accumulated across TBs)
 
-        k_ptrs = K + pid_b * k_stride_b + pid_h * k_stride_h + \
-                 offs_n_kv[None, :] * k_stride_n + offs_d[:, None] * k_stride_k # K is (D, N)
-        k_block = tl.load(k_ptrs, mask=(offs_n_kv[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim), other=0.0) # (DMODEL, BLOCK_N_KV)
-        
-        v_ptrs = V + pid_b * v_stride_b + pid_h * v_stride_h + \
-                 offs_n_kv[:, None] * v_stride_n + offs_d[None, :] * v_stride_d # V is (N, D)
-        v_block = tl.load(v_ptrs, mask=(offs_n_kv[:, None] < seq_len_kv) & (offs_d[None,:] < head_dim), other=0.0) # (BLOCK_N_KV, DMODEL)
+    # First pass: compute per-row total sigmoid sum ---------------------------
+    row_sig_total = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
 
-        p_raw_ptrs = P_raw_in + pid_b * p_raw_in_stride_b + pid_h * p_raw_in_stride_h + \
-                     offs_m_q[:, None] * p_raw_in_stride_m + offs_n_kv[None, :] * p_raw_in_stride_n
-        p_raw_block = tl.load(p_raw_ptrs, mask=(offs_m_q[:, None] < seq_len_q) & (offs_n_kv[None, :] < seq_len_kv), other=0.0)
+    for start_n in range(0, seq_len_kv, BLOCK_N_KV):
+        offs_n = start_n + tl.arange(0, BLOCK_N_KV)
 
-        sig_p_raw_ptrs = Sig_P_raw_in + pid_b * sig_p_raw_in_stride_b + pid_h * sig_p_raw_in_stride_h + \
-                         offs_m_q[:, None] * sig_p_raw_in_stride_m + offs_n_kv[None, :] * sig_p_raw_in_stride_n
-        sig_p_raw_block = tl.load(sig_p_raw_ptrs, mask=(offs_m_q[:, None] < seq_len_q) & (offs_n_kv[None, :] < seq_len_kv), other=0.0)
+        # Load K tile (D, N)
+        k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[None, :] * k_stride_n + offs_d[:, None] * k_stride_k
+        k_blk  = tl.load(k_ptrs, mask=(offs_n[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim), other=0.0)
 
-        z_penalty_ptrs = Z_penalty_in + pid_b * z_penalty_in_stride_b + pid_h * z_penalty_in_stride_h + \
-                         offs_m_q[:, None] * z_penalty_in_stride_m + offs_n_kv[None, :] * z_penalty_in_stride_n
-        z_penalty_block = tl.load(z_penalty_ptrs, mask=(offs_m_q[:, None] < seq_len_q) & (offs_n_kv[None, :] < seq_len_kv), other=0.0)
+        # Recompute raw scores & sigmoid -------------------------------------
+        p_raw = tl.dot(q_blk, k_blk) * sm_scale  # (M,N)
 
-        p_adjusted_block = p_raw_block - z_penalty_block
+        causal_mask = offs_m[:, None] < offs_n[None, :]
+        if HAS_CAUSAL_MASK:
+            p_raw = tl.where(causal_mask, -float('inf'), p_raw)
 
-        causal_cond_mask = offs_m_q[:, None] < offs_n_kv[None, :]
+        sig = _sigmoid(p_raw)
+        if HAS_CAUSAL_MASK:
+            sig = tl.where(causal_mask, 0.0, sig)
+
+        valid_mask = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
+        sig = tl.where(valid_mask, sig, 0.0)
+
+        row_sig_total += tl.sum(sig, axis=1)[:, None]
+
+    # Second pass: compute gradients -----------------------------------------
+    prefix_sig_sum_row = tl.zeros((BLOCK_M, 1), dtype=tl.float32)  # Σ sig up to prev key
+    prefix_dp_adj_row  = tl.zeros((BLOCK_M, 1), dtype=tl.float32)  # Σ dp_adjusted up to prev key
+
+    for start_n in range(0, seq_len_kv, BLOCK_N_KV):
+        offs_n = start_n + tl.arange(0, BLOCK_N_KV)
+
+        # K (D,N) and V (N,D) tiles -----------------------------------------
+        k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[None, :] * k_stride_n + offs_d[:, None] * k_stride_k
+        k_blk  = tl.load(k_ptrs, mask=(offs_n[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim), other=0.0)
+
+        v_ptrs = V + bid * v_stride_b + hid * v_stride_h + offs_n[:, None] * v_stride_n + offs_d[None, :] * v_stride_d
+        v_blk  = tl.load(v_ptrs, mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim), other=0.0)
+
+        # Recompute scores, sigmoid, z_penalty, softmax ----------------------
+        p_raw = tl.dot(q_blk, k_blk) * sm_scale  # (M,N)
+        causal_mask = offs_m[:, None] < offs_n[None, :]
+        if HAS_CAUSAL_MASK:
+            p_raw = tl.where(causal_mask, -float('inf'), p_raw)
+
+        sig = _sigmoid(p_raw)
+        if HAS_CAUSAL_MASK:
+            sig = tl.where(causal_mask, 0.0, sig)
+
+        valid_mask = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
+        sig = tl.where(valid_mask, sig, 0.0)
+
+        # z_penalty: suffix sum of sig ---------------------------------------
+        prefix_sig_local = tl.cumsum(sig, axis=1)                # running prefix inside tile
+        z_penalty = row_sig_total - (prefix_sig_sum_row + prefix_sig_local) + sig
+        prefix_sig_sum_row += tl.sum(sig, axis=1)[:, None]
+
+        p_adj = p_raw - z_penalty
+        if HAS_CAUSAL_MASK:
+            p_adj = tl.where(causal_mask, causal_mask_value, p_adj)
+        p_adj = tl.where(valid_mask, p_adj, causal_mask_value)
+
+        # softmax probability s ---------------------------------------------
+        s = tl.exp(p_adj - lse_row)
+        if HAS_CAUSAL_MASK:
+            s = tl.where(causal_mask, 0.0, s)
+        s = tl.where(valid_mask, s, 0.0)
+
+        # --- dv contribution ------------------------------------------------
+        dv_contrib = tl.dot(tl.trans(s.to(tl.float32)), do_blk.to(tl.float32))  # (N,D)
+        dv_ptrs = DV + bid * dv_stride_b + hid * dv_stride_h + offs_n[:, None] * dv_stride_n + offs_d[None, :] * dv_stride_d
+        tl.atomic_add(dv_ptrs, dv_contrib.to(DV.dtype.element_ty), mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim))
+
+        # --- ds -------------------------------------------------------------
+        ds = tl.dot(do_blk.to(tl.float32), tl.trans(v_blk.to(tl.float32)))  # (M,N)
+
+        sum_ds_s = tl.sum(ds * s.to(tl.float32), axis=1)[:, None]
+        dp_adj = s.to(tl.float32) * (ds - sum_ds_s)  # (M,N)
 
         if HAS_CAUSAL_MASK:
-            p_adjusted_block = tl.where(causal_cond_mask, causal_mask_value, p_adjusted_block)
-        
-        _s_block_fp32 = tl.exp(p_adjusted_block - lse_row)
-        s_block = _s_block_fp32.to(Q.dtype.element_ty)
+            dp_adj = tl.where(causal_mask, 0.0, dp_adj)
+        dp_adj = tl.where(valid_mask, dp_adj, 0.0)
 
+        # --- sigma'(p_raw) --------------------------------------------------
+        sigma_prime = sig.to(tl.float32) * (1.0 - sig.to(tl.float32))
+
+        # prefix of dp_adj ----------------------------------------------------
+        prefix_dp_local = tl.cumsum(dp_adj, axis=1)
+        c_block = prefix_dp_adj_row + prefix_dp_local
+        prefix_dp_adj_row += tl.sum(dp_adj, axis=1)[:, None]
+
+        dp_raw = dp_adj - sigma_prime * c_block
         if HAS_CAUSAL_MASK:
-            s_block = tl.where(causal_cond_mask, 0.0, s_block)
-        s_block = tl.where(offs_m_q[:, None] < seq_len_q, s_block, 0.0)
+            dp_raw = tl.where(causal_mask, 0.0, dp_raw)
+        dp_raw = tl.where(valid_mask, dp_raw, 0.0)
 
-        ds_block = tl.dot(do_block.to(tl.float32), tl.trans(v_block.to(tl.float32)))
+        # --- DK accumulation (atomic) --------------------------------------
+        dk_contrib = tl.dot(tl.trans(dp_raw * sm_scale), q_blk.to(tl.float32))  # (N,D)
+        dk_ptrs = DK + bid * dk_stride_b + hid * dk_stride_h + offs_n[:, None] * dk_stride_n + offs_d[None, :] * dk_stride_k
+        tl.atomic_add(dk_ptrs, dk_contrib.to(DK.dtype.element_ty), mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim))
 
-        sum_ds_s = tl.sum(ds_block * s_block.to(tl.float32), axis=1)[:, None]
-        dp_adjusted_block = s_block.to(tl.float32) * (ds_block - sum_ds_s)
-        
-        if HAS_CAUSAL_MASK:
-            # Use the already defined causal_cond_mask
-            dp_adjusted_block = tl.where(causal_cond_mask, 0.0, dp_adjusted_block)
-        dp_adjusted_block = tl.where(offs_m_q[:, None] < seq_len_q, dp_adjusted_block, 0.0)
+        # --- DQ accumulator -------------------------------------------------
+        dq_acc += tl.dot(dp_raw * sm_scale, tl.trans(k_blk.to(tl.float32)))
 
-        sig_p_raw_block_fp32 = sig_p_raw_block.to(tl.float32)
-        sigma_prime_block = sig_p_raw_block_fp32 * (1.0 - sig_p_raw_block_fp32)
-
-        c_local_prefix_sum_dp_adj = tl.cumsum(dp_adjusted_block, axis=1)
-
-        c_block = c_prefix_sum_acc_row + c_local_prefix_sum_dp_adj
-        
-        dp_raw_block = dp_adjusted_block - sigma_prime_block * c_block
-        if HAS_CAUSAL_MASK:
-            dp_raw_block = tl.where(causal_cond_mask, 0.0, dp_raw_block)
-        dp_raw_block = tl.where(offs_m_q[:, None] < seq_len_q, dp_raw_block, 0.0)
-        
-        c_prefix_sum_acc_row += tl.sum(dp_adjusted_block, axis=1)[:, None]
-
-        dv_contrib = tl.dot(tl.trans(s_block.to(tl.float32)), do_block.to(tl.float32))
-        dv_ptrs = DV + pid_b * dv_stride_b + pid_h * dv_stride_h + \
-                  offs_n_kv[:, None] * dv_stride_n + offs_d[None, :] * dv_stride_d
-        tl.atomic_add(dv_ptrs, dv_contrib.to(DV.dtype.element_ty), mask=(offs_n_kv[:, None] < seq_len_kv) & (offs_d[None,:] < head_dim))
-
-        dk_contrib = tl.dot(tl.trans(dp_raw_block * sm_scale), q_block.to(tl.float32))
-        dk_ptrs = DK + pid_b * dk_stride_b + pid_h * dk_stride_h + \
-                  offs_n_kv[:, None] * dk_stride_n + offs_d[None, :] * dk_stride_k
-        tl.atomic_add(dk_ptrs, dk_contrib.to(DK.dtype.element_ty), mask=(offs_n_kv[:, None] < seq_len_kv) & (offs_d[None,:] < head_dim))
-        
-        dq_acc += tl.dot(dp_raw_block * sm_scale, tl.trans(k_block.to(tl.float32)))
-
-    dq_ptrs = DQ + pid_b * dq_stride_b + pid_h * dq_stride_h + \
-              offs_m_q[:, None] * dq_stride_m + offs_d[None, :] * dq_stride_k
-    tl.store(dq_ptrs, dq_acc.to(DQ.dtype.element_ty), \
-             mask=(offs_m_q[:, None] < seq_len_q) & (offs_d[None,:] < head_dim)) 
+    # Store DQ ----------------------------------------------------------------
+    dq_ptrs = DQ + bid * dq_stride_b + hid * dq_stride_h + offs_m[:, None] * dq_stride_m + offs_d[None, :] * dq_stride_k
+    tl.store(dq_ptrs, dq_acc.to(DQ.dtype.element_ty), mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim)) 
