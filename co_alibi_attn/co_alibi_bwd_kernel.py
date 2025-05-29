@@ -83,7 +83,8 @@ def _co_alibi_bwd_kernel(
         valid_mask = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
         sig = tl.where(valid_mask, sig, 0.0)
 
-        row_sig_total += tl.sum(sig, axis=1)[:, None]
+        # Accumulate in fp32 for numerical accuracy
+        row_sig_total += tl.sum(sig.to(tl.float32), axis=1)[:, None]
 
     # Second pass: compute gradients -----------------------------------------
     prefix_sig_sum_row = tl.zeros((BLOCK_M, 1), dtype=tl.float32)  # Σ sig up to prev key
@@ -112,10 +113,12 @@ def _co_alibi_bwd_kernel(
         valid_mask = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
         sig = tl.where(valid_mask, sig, 0.0)
 
+        sig_f32 = sig.to(tl.float32)
+
         # z_penalty: suffix sum of sig ---------------------------------------
-        prefix_sig_local = tl.cumsum(sig, axis=1)                # running prefix inside tile
-        z_penalty = row_sig_total - (prefix_sig_sum_row + prefix_sig_local) + sig
-        prefix_sig_sum_row += tl.sum(sig, axis=1)[:, None]
+        prefix_sig_local = tl.cumsum(sig_f32, axis=1)                # running prefix inside tile
+        z_penalty = row_sig_total - (prefix_sig_sum_row + prefix_sig_local) + sig_f32
+        prefix_sig_sum_row += tl.sum(sig_f32, axis=1)[:, None]
 
         p_adj = p_raw - z_penalty
         if HAS_CAUSAL_MASK:
