@@ -4,10 +4,47 @@ import math  # needed only for documentation clarity (no runtime use)
 
 LOG2_E = tl.constexpr(1.4426950408889634)
 
+# ---------------- Autotune configurations ----------------
+# To improve performance on large sequence lengths (e.g., 4k) while avoiding
+# register spilling, we keep the tile sizes relatively small. Six hand-picked
+# configurations are provided for Triton to autotune over. These configs vary
+# the sequence tile sizes (BLOCK_M, BLOCK_N), number of warps and pipeline
+# stages — a good starting point for balancing arithmetic intensity and memory
+# pressure for Co-ALIBI's heavier register usage.
+_configs = [
+    # --- Small baseline tiles ---
+    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 64},   num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 64},   num_warps=4, num_stages=6),
+    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 128},  num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 128},  num_warps=4, num_stages=6),
+
+    # --- Medium tiles with taller query chunk ---
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 32},   num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 32},   num_warps=4, num_stages=6),
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},   num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},   num_warps=4, num_stages=6),
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128},  num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128},  num_warps=8, num_stages=4),
+
+    # --- Larger tiles: keep within register limits ---
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32},   num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32},   num_warps=4, num_stages=6),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},   num_warps=8, num_stages=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},   num_warps=8, num_stages=6),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128},  num_warps=8, num_stages=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128},  num_warps=8, num_stages=6),
+]
+
+def _prune_configs(configs, named_args, **kwargs):
+    """Prune configs that would overshoot the actual sequence length."""
+    seq_len_q = kwargs.get("seq_len_q", 0)
+    return [cfg for cfg in configs if cfg.kwargs["BLOCK_M"] <= seq_len_q]
+
 @triton.jit
 def _sigmoid(x):
     return 1.0 / (1.0 + tl.exp2(-x * LOG2_E))
 
+@triton.autotune(configs=_configs, key=["seq_len_q", "head_dim"], prune_configs_by={"early_config_prune": _prune_configs})
 @triton.jit
 def _co_alibi_fwd_kernel(
     Q, K, V, sm_scale, causal_mask_value,
@@ -24,7 +61,7 @@ def _co_alibi_fwd_kernel(
     batch_size: tl.constexpr, num_heads: tl.constexpr,
     seq_len_q: tl.constexpr, seq_len_kv: tl.constexpr, head_dim: tl.constexpr,
     HAS_CAUSAL_MASK: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, KV_BLOCKS: tl.constexpr
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr
 ):
 
     pid_m = tl.program_id(axis=0)
@@ -42,7 +79,10 @@ def _co_alibi_fwd_kernel(
     o_acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
     z_running = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
 
-    for blk_idx_from_right in tl.static_range(KV_BLOCKS):
+    # Compute the number of key/value tiles this kernel will iterate over.
+    KV_BLOCKS = (seq_len_kv + BLOCK_N - 1) // BLOCK_N
+
+    for blk_idx_from_right in tl.range(KV_BLOCKS):
         start_k = (KV_BLOCKS - 1 - blk_idx_from_right) * BLOCK_N
         offs_n = start_k + tl.arange(0, BLOCK_N)
         row_end = pid_m * BLOCK_M + (BLOCK_M - 1)

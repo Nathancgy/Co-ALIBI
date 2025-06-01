@@ -19,10 +19,10 @@ except ImportError as e:  # pragma: no cover
 
 
 def benchmark_fwd_flops(
-    B: int = 4,
-    H: int = 8,
-    seq_lens=(1024, 2048),
-    D: int = 64,
+    B: int = 1,
+    H: int = 16,
+    seq_lens={4096},
+    D: int = 128,
     dtype: torch.dtype = torch.bfloat16,
 ):
     """Benchmark forward-pass TFLOPs for Co-ALIBI vs FlashAttention-2.

@@ -88,6 +88,9 @@ class CoALIBIAttention(torch.autograd.Function):
                 except Exception as _e:
                     pass
         else:
+            def grid(meta):
+                return (triton.cdiv(seq_len_q, meta["BLOCK_M"]), batch_size * num_heads)
+
             _co_alibi_fwd_kernel[grid](
                 Q=q, K=k, V=v, sm_scale=sm_scale, causal_mask_value=causal_mask_value_fwd,
                 P_raw_out=p_raw_for_bwd, Sig_P_raw_out=sig_p_raw, Z_penalty_out=z_penalty, LSE_out=lse,
@@ -101,10 +104,15 @@ class CoALIBIAttention(torch.autograd.Function):
                 z_penalty_out_stride_b=z_penalty.stride(0), z_penalty_out_stride_h=z_penalty.stride(1), z_penalty_out_stride_m=z_penalty.stride(2), z_penalty_out_stride_n=z_penalty.stride(3),
                 lse_out_stride_b=lse.stride(0), lse_out_stride_h=lse.stride(1), lse_out_stride_m=lse.stride(2),
                 batch_size=batch_size, num_heads=num_heads, seq_len_q=seq_len_q, seq_len_kv=seq_len_kv, head_dim=head_dim,
-                HAS_CAUSAL_MASK=causal, 
-                BLOCK_M=BLOCK_M_triton, BLOCK_N=BLOCK_N_triton, BLOCK_D=BLOCK_D_triton, KV_BLOCKS=kv_blocks,
-                num_warps=num_warps_kernel, num_stages=num_stages_kernel
+                HAS_CAUSAL_MASK=causal,
+                BLOCK_D=head_dim
             )
+            if os.getenv('COALIBI_VERBOSE', '0') == '1':
+                try:
+                    best_cfg = _co_alibi_fwd_kernel.get_best_config()
+                    print(f"[Co-ALIBI] Original kernel best config: {best_cfg.kwargs}, num_warps={best_cfg.num_warps}, num_stages={best_cfg.num_stages}")
+                except Exception as _e:
+                    pass
         
         ctx.save_for_backward(q, k, v, o, p_raw_for_bwd, sig_p_raw, z_penalty, lse)
         ctx.sm_scale = sm_scale
