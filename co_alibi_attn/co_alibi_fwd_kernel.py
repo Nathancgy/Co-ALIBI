@@ -1,9 +1,16 @@
-import triton # type: ignore[import-unresolved]
-import triton.language as tl # type: ignore[import-unresolved]
+import triton  # type: ignore[import-unresolved]
+import triton.language as tl  # type: ignore[import-unresolved]
+import math  # needed only for documentation clarity (no runtime use)
+
+# Pre-computed constant so that 2 ** (x * LOG2_E) == exp(x).
+# Must be declared as a Triton constexpr so that it is visible inside JITed
+# kernels.
+LOG2_E = tl.constexpr(1.4426950408889634)  # 1 / ln(2)
 
 @triton.jit
 def _sigmoid(x):
-    return 1.0 / (1.0 + tl.exp(-x))
+    """Numerically-stable sigmoid using base-2 exponentials."""
+    return 1.0 / (1.0 + tl.exp2(-x * LOG2_E))
 
 @triton.jit
 def _co_alibi_fwd_kernel(
@@ -72,8 +79,8 @@ def _co_alibi_fwd_kernel(
         p_adj_blk = tl.where(key_valid_mask, p_adj_blk, causal_mask_value)
 
         m_i_new = tl.maximum(m_i, tl.max(p_adj_blk, axis=1)[:, None])
-        exp_diff = tl.exp(m_i - m_i_new) 
-        exp_p_adj_minus_m_new = tl.exp(p_adj_blk - m_i_new)
+        exp_diff = tl.exp2((m_i - m_i_new) * LOG2_E)
+        exp_p_adj_minus_m_new = tl.exp2((p_adj_blk - m_i_new) * LOG2_E)
         if HAS_CAUSAL_MASK: 
             exp_p_adj_minus_m_new = tl.where(causal_mask, 0.0, exp_p_adj_minus_m_new)
         key_valid_mask_for_scores = key_valid_mask

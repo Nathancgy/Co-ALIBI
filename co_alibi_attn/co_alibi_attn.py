@@ -1,6 +1,7 @@
 import torch
 import triton # type: ignore[import-unresolved]
 import triton.language as tl # type: ignore[import-unresolved]
+import os
 
 from co_alibi_fwd_kernel import _co_alibi_fwd_kernel
 from co_alibi_bwd_kernel import _co_alibi_bwd_kernel
@@ -79,6 +80,8 @@ class CoALIBIAttention(torch.autograd.Function):
         dk = torch.zeros_like(k, dtype=torch.float32)
         dv = torch.zeros_like(v, dtype=torch.float32)
 
+        debug_mode = os.getenv("COALIBI_DEBUG", "0") == "1"
+
         BLOCK_M_triton = 32
         BLOCK_N_triton = 64
         
@@ -101,27 +104,55 @@ class CoALIBIAttention(torch.autograd.Function):
         if BLOCK_N_KV_triton >= 64 and BLOCK_DMODEL_triton >= 64:
             num_warps = 8
 
+        # Debug tensors ------------------------------------------------------
+        if debug_mode:
+            dp_raw_dbg = torch.empty_like(p_raw, dtype=torch.float32)
+            s_dbg      = torch.empty_like(p_raw, dtype=torch.float32)
+        else:
+            # Dummy 1-element tensors to satisfy kernel signature
+            dp_raw_dbg = torch.empty(1, device=q.device, dtype=torch.float32)
+            s_dbg      = torch.empty(1, device=q.device, dtype=torch.float32)
+
         _co_alibi_bwd_kernel[grid](
             Q=q, K=k, V=v, sm_scale=sm_scale, causal_mask_value=causal_mask_value, 
-            P_raw_in=p_raw, Sig_P_raw_in=sig_p_raw, Z_penalty_in=z_penalty, LSE_in=lse,
+            LSE_in=lse,
             DO=do,
+            O=o,
             DQ=dq, DK=dk, DV=dv,
             q_stride_b=q.stride(0), q_stride_h=q.stride(1), q_stride_m=q.stride(2), q_stride_k=q.stride(3),
             k_stride_b=k.stride(0), k_stride_h=k.stride(1), k_stride_n=k.stride(2), k_stride_k=k.stride(3),
             v_stride_b=v.stride(0), v_stride_h=v.stride(1), v_stride_n=v.stride(2), v_stride_d=v.stride(3),
-            p_raw_in_stride_b=p_raw.stride(0), p_raw_in_stride_h=p_raw.stride(1), p_raw_in_stride_m=p_raw.stride(2), p_raw_in_stride_n=p_raw.stride(3),
-            sig_p_raw_in_stride_b=sig_p_raw.stride(0), sig_p_raw_in_stride_h=sig_p_raw.stride(1), sig_p_raw_in_stride_m=sig_p_raw.stride(2), sig_p_raw_in_stride_n=sig_p_raw.stride(3),
-            z_penalty_in_stride_b=z_penalty.stride(0), z_penalty_in_stride_h=z_penalty.stride(1), z_penalty_in_stride_m=z_penalty.stride(2), z_penalty_in_stride_n=z_penalty.stride(3),
             lse_in_stride_b=lse.stride(0), lse_in_stride_h=lse.stride(1), lse_in_stride_m=lse.stride(2),
             do_stride_b=do.stride(0), do_stride_h=do.stride(1), do_stride_m=do.stride(2), do_stride_d=do.stride(3),
             dq_stride_b=dq.stride(0), dq_stride_h=dq.stride(1), dq_stride_m=dq.stride(2), dq_stride_k=dq.stride(3),
             dk_stride_b=dk.stride(0), dk_stride_h=dk.stride(1), dk_stride_n=dk.stride(2), dk_stride_k=dk.stride(3),
             dv_stride_b=dv.stride(0), dv_stride_h=dv.stride(1), dv_stride_n=dv.stride(2), dv_stride_d=dv.stride(3),
+            o_stride_b=o.stride(0), o_stride_h=o.stride(1), o_stride_m=o.stride(2), o_stride_d=o.stride(3),
             batch_size=batch_size, num_heads=num_heads, seq_len_q=seq_len_q, seq_len_kv=seq_len_kv, head_dim=head_dim,
             HAS_CAUSAL_MASK=causal, 
-            BLOCK_M=BLOCK_M_triton, BLOCK_N_KV=BLOCK_N_KV_triton, BLOCK_DMODEL=BLOCK_DMODEL_triton, N_CTX_KV=N_CTX_KV_triton,
-            NUM_WARPS=num_warps
+            BLOCK_M=BLOCK_M_triton, BLOCK_N_KV=BLOCK_N_KV_triton, BLOCK_DMODEL=BLOCK_DMODEL_triton,
+            NUM_WARPS=num_warps,
+            DEBUG=debug_mode,
+            DP_RAW_OUT=dp_raw_dbg, S_OUT=s_dbg,
+            dp_raw_out_stride_b=dp_raw_dbg.stride(0) if dp_raw_dbg.dim()==4 else 0,
+            dp_raw_out_stride_h=dp_raw_dbg.stride(1) if dp_raw_dbg.dim()==4 else 0,
+            dp_raw_out_stride_m=dp_raw_dbg.stride(2) if dp_raw_dbg.dim()==4 else 0,
+            dp_raw_out_stride_n=dp_raw_dbg.stride(3) if dp_raw_dbg.dim()==4 else 0,
+            s_out_stride_b=s_dbg.stride(0) if s_dbg.dim()==4 else 0,
+            s_out_stride_h=s_dbg.stride(1) if s_dbg.dim()==4 else 0,
+            s_out_stride_m=s_dbg.stride(2) if s_dbg.dim()==4 else 0,
+            s_out_stride_n=s_dbg.stride(3) if s_dbg.dim()==4 else 0,
         )
+
+        # Expose debug tensors ---------------------------------------------
+        global debug_dp_raw, debug_s
+        if debug_mode:
+            debug_dp_raw = dp_raw_dbg
+            debug_s = s_dbg
+        else:
+            debug_dp_raw = None
+            debug_s = None
+
         return dq, dk.to(k.dtype), dv.to(v.dtype), None, None
 
 def co_alibi_attention(q, k, v, causal=True, sm_scale=None):

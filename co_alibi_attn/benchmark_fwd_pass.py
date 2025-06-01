@@ -57,7 +57,7 @@ def first_mismatch(a: torch.Tensor, b: torch.Tensor, atol=1e-3, rtol=5e-3):
 
 def main():
     B, H, N_q, N_k, D = 4, 8, 1024, 1024, 64 
-    dtype = torch.float32
+    dtype = torch.bfloat16
 
     torch.manual_seed(0)
 

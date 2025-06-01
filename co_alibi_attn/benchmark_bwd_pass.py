@@ -69,6 +69,26 @@ def main():
     out_tri.backward(dout)
     dq_tri, dk_tri, dv_tri = q.grad.detach(), k.grad.detach(), v.grad.detach()
 
+    # ---------------- Optional debug comparisons ---------------------------
+    if os.getenv("COALIBI_DEBUG", "0") == "1":
+        from co_alibi_attn import debug_dp_raw, debug_s
+
+        # Recompute reference intermediates needed for gradients -------------
+        p_raw_ref, sig_ref, z_penalty_ref, s_ref = ref_intermediates
+        sigma_prime_ref = sig_ref * (1.0 - sig_ref)
+
+        ds_ref = torch.einsum("bhid,bhjd->bhij", dout, v)
+        sum_ds_s_ref = (ds_ref * s_ref).sum(dim=-1, keepdim=True)
+        dp_adj_ref = s_ref * (ds_ref - sum_ds_s_ref)
+        c_prefix_ref = torch.cumsum(dp_adj_ref, dim=-1)
+        dp_raw_ref = dp_adj_ref - sigma_prime_ref * c_prefix_ref
+
+        print("\n--- Debug backward intermediates (max abs diff) ---")
+        if debug_dp_raw is not None:
+            print("dp_raw diff:", (debug_dp_raw - dp_raw_ref).abs().max().item())
+        if debug_s is not None:
+            print("softmax s diff:", (debug_s - s_ref).abs().max().item())
+
     # ---------------- Comparison --------------------------------------------
     print("Forward output diff       :", (out_tri - out_ref).abs().max().item())
     print("dq max diff (abs)         :", (dq_tri - dq_ref).abs().max().item())

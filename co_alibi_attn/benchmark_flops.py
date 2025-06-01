@@ -23,7 +23,7 @@ def benchmark_fwd_flops(
     H: int = 8,
     seq_lens=(1024, 2048),
     D: int = 64,
-    dtype: torch.dtype = torch.float16,
+    dtype: torch.dtype = torch.bfloat16,
 ):
     """Benchmark forward-pass TFLOPs for Co-ALIBI vs FlashAttention-2.
 
