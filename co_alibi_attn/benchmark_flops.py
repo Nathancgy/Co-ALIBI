@@ -49,8 +49,11 @@ def benchmark_fwd_flops(
         # Build minimal callables for do_bench
         # -------------------------------------------------------------
 
-        def co_alibi_fwd():
-            co_alibi_attention(q, k, v, causal=True, sm_scale=sm_scale)
+        def co_alibi_fwd_original():
+            co_alibi_attention(q, k, v, causal=True, sm_scale=sm_scale, use_simplified_kernel=False)
+
+        def co_alibi_fwd_simplified():
+            co_alibi_attention(q, k, v, causal=True, sm_scale=sm_scale, use_simplified_kernel=True)
 
         # FlashAttention-2 expects (B, S, H, D) layout.
         q_flash = q.transpose(1, 2).contiguous()  # (B, S, H, D)
@@ -68,7 +71,8 @@ def benchmark_fwd_flops(
             )
 
         # Warm-up & benchmark
-        ms_co_alibi = triton.testing.do_bench(co_alibi_fwd, rep=100, warmup=250)
+        ms_co_alibi_original = triton.testing.do_bench(co_alibi_fwd_original, rep=100, warmup=250)
+        ms_co_alibi_simplified = triton.testing.do_bench(co_alibi_fwd_simplified, rep=100, warmup=250)
         ms_flash    = triton.testing.do_bench(flash_attn_fwd, rep=100, warmup=250)
 
         # FLOPs under 4·D convention
@@ -76,23 +80,27 @@ def benchmark_fwd_flops(
         flops_per_qk = 4 * D
         total_flops = B * H * S * SKV * flops_per_qk
 
-        tflops_co_alibi = total_flops / (ms_co_alibi * 1e-3) / 1e12
+        tflops_co_alibi_original = total_flops / (ms_co_alibi_original * 1e-3) / 1e12
+        tflops_co_alibi_simplified = total_flops / (ms_co_alibi_simplified * 1e-3) / 1e12
         tflops_flash    = total_flops / (ms_flash * 1e-3) / 1e12
 
-        line = "=" * 60
+        line = "=" * 70  # Adjusted line width for better formatting
         print(line)
         print(f"Config: B={B}, H={H}, S={S}, D={D}, dtype={dtype.__str__().split('.')[-1]}  (total_flops={total_flops/1e12:.2f} TF)")
         print(line)
 
         def _report(name: str, latency_ms: float, tflops: float):
-            print(f"{name:<22}  latency = {latency_ms:7.3f} ms   |  throughput = {tflops:6.2f} TFLOP/s")
+            print(f"{name:<30}  latency = {latency_ms:7.3f} ms   |  throughput = {tflops:6.2f} TFLOP/s")
 
-        _report("Co-ALIBI (Triton)", ms_co_alibi, tflops_co_alibi)
+        _report("Co-ALIBI (Triton Original)", ms_co_alibi_original, tflops_co_alibi_original)
+        _report("Co-ALIBI (Triton Simplified)", ms_co_alibi_simplified, tflops_co_alibi_simplified)
         _report("FlashAttention-2", ms_flash, tflops_flash)
         print(line)
         if tflops_flash > 0:
-            speedup = tflops_co_alibi / tflops_flash
-            print(f"Co-ALIBI vs FlashAttention-2 speed-up: ×{speedup:.2f} (TFLOP/s based)")
+            speedup_original = tflops_co_alibi_original / tflops_flash
+            speedup_simplified = tflops_co_alibi_simplified / tflops_flash
+            print(f"Co-ALIBI Original vs FlashAttention-2 speed-up: ×{speedup_original:.2f} (TFLOP/s based)")
+            print(f"Co-ALIBI Simplified vs FlashAttention-2 speed-up: ×{speedup_simplified:.2f} (TFLOP/s based)")
         print(line)
 
 

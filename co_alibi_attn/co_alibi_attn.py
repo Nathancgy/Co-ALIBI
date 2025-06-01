@@ -4,11 +4,12 @@ import triton.language as tl # type: ignore[import-unresolved]
 import os
 
 from co_alibi_fwd_kernel import _co_alibi_fwd_kernel
+from co_alibi_fwd_kernel_simplified import _co_alibi_fwd_kernel_simplified
 from co_alibi_bwd_kernel import _co_alibi_bwd_kernel
 
 class CoALIBIAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale):
+    def forward(ctx, q, k, v, causal, sm_scale, use_simplified_kernel=False):
         batch_size, num_heads, seq_len_q, head_dim = q.shape
         _, _, seq_len_kv, _ = k.shape
 
@@ -19,50 +20,98 @@ class CoALIBIAttention(torch.autograd.Function):
 
         o = torch.empty_like(q)
         
-        p_raw_for_bwd = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=q.dtype)
-        sig_p_raw = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=q.dtype)
-        z_penalty = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=q.dtype)
+        if use_simplified_kernel:
+            # Dummy 1-element tensors – simplified kernel doesn't store debug info.
+            p_raw_for_bwd = torch.empty(1, device=q.device, dtype=q.dtype)
+            sig_p_raw    = torch.empty(1, device=q.device, dtype=q.dtype)
+            z_penalty    = torch.empty(1, device=q.device, dtype=q.dtype)
+        else:
+            p_raw_for_bwd = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=q.dtype)
+            sig_p_raw    = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=q.dtype)
+            z_penalty    = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=q.dtype)
         lse = torch.empty((batch_size, num_heads, seq_len_q), device=q.device, dtype=torch.float32)
 
         causal_mask_value_fwd = -torch.finfo(torch.float32).max 
 
-        BLOCK_M_triton = 32
-        BLOCK_N_triton = 64
-        
-        if head_dim <= 16: BLOCK_D_triton = 16
-        elif head_dim <= 32: BLOCK_D_triton = 32
-        elif head_dim <= 64: BLOCK_D_triton = 64
-        elif head_dim <= 128: BLOCK_D_triton = 128
-        else:
-            BLOCK_D_triton = 128
-        if head_dim in [16, 32, 64, 128]:
-            BLOCK_D_triton = head_dim
+        if not use_simplified_kernel:
+            BLOCK_M_triton = 32
+            BLOCK_N_triton = 64
 
-        kv_blocks = (seq_len_kv + BLOCK_N_triton - 1) // BLOCK_N_triton
-        grid = (triton.cdiv(seq_len_q, BLOCK_M_triton), batch_size * num_heads)
-        
-        _co_alibi_fwd_kernel[grid](
-            Q=q, K=k, V=v, sm_scale=sm_scale, causal_mask_value=causal_mask_value_fwd,
-            P_raw_out=p_raw_for_bwd, Sig_P_raw_out=sig_p_raw, Z_penalty_out=z_penalty, LSE_out=lse,
-            Out=o,
-            q_stride_b=q.stride(0), q_stride_h=q.stride(1), q_stride_m=q.stride(2), q_stride_k=q.stride(3),
-            k_stride_b=k.stride(0), k_stride_h=k.stride(1), k_stride_n=k.stride(2), k_stride_k=k.stride(3),
-            v_stride_b=v.stride(0), v_stride_h=v.stride(1), v_stride_n=v.stride(2), v_stride_d=v.stride(3),
-            out_stride_b=o.stride(0), out_stride_h=o.stride(1), out_stride_m=o.stride(2), out_stride_d=o.stride(3),
-            p_raw_out_stride_b=p_raw_for_bwd.stride(0), p_raw_out_stride_h=p_raw_for_bwd.stride(1), p_raw_out_stride_m=p_raw_for_bwd.stride(2), p_raw_out_stride_n=p_raw_for_bwd.stride(3),
-            sig_p_raw_out_stride_b=sig_p_raw.stride(0), sig_p_raw_out_stride_h=sig_p_raw.stride(1), sig_p_raw_out_stride_m=sig_p_raw.stride(2), sig_p_raw_out_stride_n=sig_p_raw.stride(3),
-            z_penalty_out_stride_b=z_penalty.stride(0), z_penalty_out_stride_h=z_penalty.stride(1), z_penalty_out_stride_m=z_penalty.stride(2), z_penalty_out_stride_n=z_penalty.stride(3),
-            lse_out_stride_b=lse.stride(0), lse_out_stride_h=lse.stride(1), lse_out_stride_m=lse.stride(2),
-            batch_size=batch_size, num_heads=num_heads, seq_len_q=seq_len_q, seq_len_kv=seq_len_kv, head_dim=head_dim,
-            HAS_CAUSAL_MASK=causal, 
-            BLOCK_M=BLOCK_M_triton, BLOCK_N=BLOCK_N_triton, BLOCK_D=BLOCK_D_triton, KV_BLOCKS=kv_blocks
-        )
+            if head_dim <= 16: BLOCK_D_triton = 16
+            elif head_dim <= 32: BLOCK_D_triton = 32
+            elif head_dim <= 64: BLOCK_D_triton = 64
+            elif head_dim <= 128: BLOCK_D_triton = 128
+            else:
+                BLOCK_D_triton = 128
+            if head_dim in [16, 32, 64, 128]:
+                BLOCK_D_triton = head_dim
+
+            kv_blocks = (seq_len_kv + BLOCK_N_triton - 1) // BLOCK_N_triton
+            grid = (triton.cdiv(seq_len_q, BLOCK_M_triton), batch_size * num_heads)
+
+            num_warps_kernel = 8 if (BLOCK_M_triton >= 128 or BLOCK_N_triton >= 128) else 4
+            num_stages_kernel = 4
+
+        if use_simplified_kernel:
+            def grid(meta):
+                return (triton.cdiv(seq_len_q, meta['BLOCK_M']), batch_size * num_heads)
+
+            _co_alibi_fwd_kernel_simplified[grid](
+                Q=q, K=k, V=v, sm_scale=sm_scale, causal_mask_value=causal_mask_value_fwd,
+                P_raw_out=p_raw_for_bwd, Sig_P_raw_out=sig_p_raw, Z_penalty_out=z_penalty, LSE_out=lse,
+                Out=o,
+                q_stride_b=q.stride(0), q_stride_h=q.stride(1), q_stride_m=q.stride(2), q_stride_k=q.stride(3),
+                k_stride_b=k.stride(0), k_stride_h=k.stride(1), k_stride_n=k.stride(2), k_stride_k=k.stride(3),
+                v_stride_b=v.stride(0), v_stride_h=v.stride(1), v_stride_n=v.stride(2), v_stride_d=v.stride(3),
+                out_stride_b=o.stride(0), out_stride_h=o.stride(1), out_stride_m=o.stride(2), out_stride_d=o.stride(3),
+                p_raw_out_stride_b=p_raw_for_bwd.stride(0) if p_raw_for_bwd.dim()>1 else 0,
+                p_raw_out_stride_h=p_raw_for_bwd.stride(1) if p_raw_for_bwd.dim()>1 else 0,
+                p_raw_out_stride_m=p_raw_for_bwd.stride(2) if p_raw_for_bwd.dim()>1 else 0,
+                p_raw_out_stride_n=p_raw_for_bwd.stride(3) if p_raw_for_bwd.dim()>1 else 0,
+                sig_p_raw_out_stride_b=sig_p_raw.stride(0) if sig_p_raw.dim()>1 else 0,
+                sig_p_raw_out_stride_h=sig_p_raw.stride(1) if sig_p_raw.dim()>1 else 0,
+                sig_p_raw_out_stride_m=sig_p_raw.stride(2) if sig_p_raw.dim()>1 else 0,
+                sig_p_raw_out_stride_n=sig_p_raw.stride(3) if sig_p_raw.dim()>1 else 0,
+                z_penalty_out_stride_b=z_penalty.stride(0) if z_penalty.dim()>1 else 0,
+                z_penalty_out_stride_h=z_penalty.stride(1) if z_penalty.dim()>1 else 0,
+                z_penalty_out_stride_m=z_penalty.stride(2) if z_penalty.dim()>1 else 0,
+                z_penalty_out_stride_n=z_penalty.stride(3) if z_penalty.dim()>1 else 0,
+                lse_out_stride_b=lse.stride(0), lse_out_stride_h=lse.stride(1), lse_out_stride_m=lse.stride(2),
+                batch_size=batch_size, num_heads=num_heads, seq_len_q=seq_len_q, seq_len_kv=seq_len_kv, head_dim=head_dim,
+                HAS_CAUSAL_MASK=causal,
+                BLOCK_D=head_dim
+            )
+            if os.getenv('COALIBI_VERBOSE', '0') == '1':
+                try:
+                    best_cfg = _co_alibi_fwd_kernel_simplified.get_best_config()
+                    print(f"[Co-ALIBI] Simplified kernel best config: {best_cfg.kwargs}, num_warps={best_cfg.num_warps}, num_stages={best_cfg.num_stages}")
+                except Exception as _e:
+                    pass
+        else:
+            _co_alibi_fwd_kernel[grid](
+                Q=q, K=k, V=v, sm_scale=sm_scale, causal_mask_value=causal_mask_value_fwd,
+                P_raw_out=p_raw_for_bwd, Sig_P_raw_out=sig_p_raw, Z_penalty_out=z_penalty, LSE_out=lse,
+                Out=o,
+                q_stride_b=q.stride(0), q_stride_h=q.stride(1), q_stride_m=q.stride(2), q_stride_k=q.stride(3),
+                k_stride_b=k.stride(0), k_stride_h=k.stride(1), k_stride_n=k.stride(2), k_stride_k=k.stride(3),
+                v_stride_b=v.stride(0), v_stride_h=v.stride(1), v_stride_n=v.stride(2), v_stride_d=v.stride(3),
+                out_stride_b=o.stride(0), out_stride_h=o.stride(1), out_stride_m=o.stride(2), out_stride_d=o.stride(3),
+                p_raw_out_stride_b=p_raw_for_bwd.stride(0), p_raw_out_stride_h=p_raw_for_bwd.stride(1), p_raw_out_stride_m=p_raw_for_bwd.stride(2), p_raw_out_stride_n=p_raw_for_bwd.stride(3),
+                sig_p_raw_out_stride_b=sig_p_raw.stride(0), sig_p_raw_out_stride_h=sig_p_raw.stride(1), sig_p_raw_out_stride_m=sig_p_raw.stride(2), sig_p_raw_out_stride_n=sig_p_raw.stride(3),
+                z_penalty_out_stride_b=z_penalty.stride(0), z_penalty_out_stride_h=z_penalty.stride(1), z_penalty_out_stride_m=z_penalty.stride(2), z_penalty_out_stride_n=z_penalty.stride(3),
+                lse_out_stride_b=lse.stride(0), lse_out_stride_h=lse.stride(1), lse_out_stride_m=lse.stride(2),
+                batch_size=batch_size, num_heads=num_heads, seq_len_q=seq_len_q, seq_len_kv=seq_len_kv, head_dim=head_dim,
+                HAS_CAUSAL_MASK=causal, 
+                BLOCK_M=BLOCK_M_triton, BLOCK_N=BLOCK_N_triton, BLOCK_D=BLOCK_D_triton, KV_BLOCKS=kv_blocks,
+                num_warps=num_warps_kernel, num_stages=num_stages_kernel
+            )
         
         ctx.save_for_backward(q, k, v, o, p_raw_for_bwd, sig_p_raw, z_penalty, lse)
         ctx.sm_scale = sm_scale
         ctx.causal = causal
         ctx.head_dim = head_dim
-        ctx.causal_mask_value = causal_mask_value_fwd 
+        ctx.causal_mask_value = causal_mask_value_fwd
+        ctx.use_simplified_kernel = use_simplified_kernel
         return o
 
     @staticmethod
@@ -72,6 +121,7 @@ class CoALIBIAttention(torch.autograd.Function):
         causal = ctx.causal
         head_dim = ctx.head_dim
         causal_mask_value = ctx.causal_mask_value
+        use_simplified_kernel = ctx.use_simplified_kernel
 
         batch_size, num_heads, seq_len_q, _ = q.shape
         _, _, seq_len_kv, _ = k.shape
@@ -94,7 +144,6 @@ class CoALIBIAttention(torch.autograd.Function):
         if head_dim in [16, 32, 64, 128]:
             BLOCK_D_triton = head_dim
 
-        # Aliases for backward kernel expected names
         BLOCK_N_KV_triton = BLOCK_N_triton
         BLOCK_DMODEL_triton = BLOCK_D_triton
         N_CTX_KV_triton = triton.next_power_of_2(seq_len_kv)
@@ -104,12 +153,10 @@ class CoALIBIAttention(torch.autograd.Function):
         if BLOCK_N_KV_triton >= 64 and BLOCK_DMODEL_triton >= 64:
             num_warps = 8
 
-        # Debug tensors ------------------------------------------------------
         if debug_mode:
             dp_raw_dbg = torch.empty_like(p_raw, dtype=torch.float32)
             s_dbg      = torch.empty_like(p_raw, dtype=torch.float32)
         else:
-            # Dummy 1-element tensors to satisfy kernel signature
             dp_raw_dbg = torch.empty(1, device=q.device, dtype=torch.float32)
             s_dbg      = torch.empty(1, device=q.device, dtype=torch.float32)
 
@@ -144,7 +191,6 @@ class CoALIBIAttention(torch.autograd.Function):
             s_out_stride_n=s_dbg.stride(3) if s_dbg.dim()==4 else 0,
         )
 
-        # Expose debug tensors ---------------------------------------------
         global debug_dp_raw, debug_s
         if debug_mode:
             debug_dp_raw = dp_raw_dbg
@@ -153,10 +199,13 @@ class CoALIBIAttention(torch.autograd.Function):
             debug_dp_raw = None
             debug_s = None
 
-        return dq, dk.to(k.dtype), dv.to(v.dtype), None, None
+        if use_simplified_kernel:
+            pass
 
-def co_alibi_attention(q, k, v, causal=True, sm_scale=None):
+        return dq, dk.to(k.dtype), dv.to(v.dtype), None, None, None
+
+def co_alibi_attention(q, k, v, causal=True, sm_scale=None, use_simplified_kernel=False):
     if sm_scale is None:
         sm_scale = 1.0 / (q.shape[-1]**0.5)
     q,k,v = q.contiguous(), k.contiguous(), v.contiguous()
-    return CoALIBIAttention.apply(q, k, v, causal, sm_scale) 
+    return CoALIBIAttention.apply(q, k, v, causal, sm_scale, use_simplified_kernel) 

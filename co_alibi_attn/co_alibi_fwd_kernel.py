@@ -2,14 +2,10 @@ import triton  # type: ignore[import-unresolved]
 import triton.language as tl  # type: ignore[import-unresolved]
 import math  # needed only for documentation clarity (no runtime use)
 
-# Pre-computed constant so that 2 ** (x * LOG2_E) == exp(x).
-# Must be declared as a Triton constexpr so that it is visible inside JITed
-# kernels.
-LOG2_E = tl.constexpr(1.4426950408889634)  # 1 / ln(2)
+LOG2_E = tl.constexpr(1.4426950408889634)
 
 @triton.jit
 def _sigmoid(x):
-    """Numerically-stable sigmoid using base-2 exponentials."""
     return 1.0 / (1.0 + tl.exp2(-x * LOG2_E))
 
 @triton.jit
@@ -49,57 +45,60 @@ def _co_alibi_fwd_kernel(
     for blk_idx_from_right in tl.static_range(KV_BLOCKS):
         start_k = (KV_BLOCKS - 1 - blk_idx_from_right) * BLOCK_N
         offs_n = start_k + tl.arange(0, BLOCK_N)
+        row_end = pid_m * BLOCK_M + (BLOCK_M - 1)
+        proceed = (not HAS_CAUSAL_MASK) or (start_k <= row_end)
 
-        k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[None, :] * k_stride_n + offs_d[:, None] * k_stride_k
-        k_block = tl.load(k_ptrs, mask=(offs_n[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim), other=0.0)
-        v_ptrs = V + bid * v_stride_b + hid * v_stride_h + offs_n[:, None] * v_stride_n + offs_d[None, :] * v_stride_d
-        v_block = tl.load(v_ptrs, mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim), other=0.0)
+        if proceed:
+            k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[:, None] * k_stride_n + offs_d[None, :] * k_stride_k
+            k_block_nd = tl.load(k_ptrs, mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim), other=0.0)
+            k_block = tl.trans(k_block_nd)
 
-        p_raw_blk = tl.dot(q_block, k_block) * sm_scale
-        key_valid_mask = offs_n[None, :] < seq_len_kv
-        p_raw_masked_for_sigma_blk = p_raw_blk 
-        if HAS_CAUSAL_MASK:
-            causal_mask = offs_n[None, :] > offs_m[:, None]
-            p_raw_masked_for_sigma_blk = tl.where(causal_mask, -float('inf'), p_raw_masked_for_sigma_blk)
-        p_raw_masked_for_sigma_blk = tl.where(key_valid_mask, p_raw_masked_for_sigma_blk, -float('inf'))
-        
-        sig_blk = _sigmoid(p_raw_masked_for_sigma_blk)
-        if HAS_CAUSAL_MASK:
-            sig_blk = tl.where(causal_mask, 0.0, sig_blk)
-        sig_blk = tl.where(key_valid_mask, sig_blk, 0.0)
+            v_ptrs = V + bid * v_stride_b + hid * v_stride_h + offs_n[:, None] * v_stride_n + offs_d[None, :] * v_stride_d
+            v_block = tl.load(v_ptrs, mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim), other=0.0)
 
-        prefix_sum = tl.cumsum(sig_blk, 1)
-        row_total = tl.sum(sig_blk, 1)[:, None]
-        z_blk = row_total - prefix_sum + sig_blk + z_running
-        z_running += row_total
+            p_raw_blk = tl.dot(q_block, k_block) * sm_scale
+            key_valid_mask = offs_n[None, :] < seq_len_kv
+            p_raw_masked_for_sigma_blk = p_raw_blk
+            if HAS_CAUSAL_MASK:
+                causal_mask = offs_n[None, :] > offs_m[:, None]
+                p_raw_masked_for_sigma_blk = tl.where(causal_mask, -float('inf'), p_raw_masked_for_sigma_blk)
+            p_raw_masked_for_sigma_blk = tl.where(key_valid_mask, p_raw_masked_for_sigma_blk, -float('inf'))
 
-        p_adj_blk = p_raw_blk - z_blk
-        if HAS_CAUSAL_MASK:
-            p_adj_blk = tl.where(causal_mask, causal_mask_value, p_adj_blk)
-        p_adj_blk = tl.where(key_valid_mask, p_adj_blk, causal_mask_value)
+            sig_blk = _sigmoid(p_raw_masked_for_sigma_blk)
+            if HAS_CAUSAL_MASK:
+                sig_blk = tl.where(causal_mask, 0.0, sig_blk)
+            sig_blk = tl.where(key_valid_mask, sig_blk, 0.0)
 
-        m_i_new = tl.maximum(m_i, tl.max(p_adj_blk, axis=1)[:, None])
-        exp_diff = tl.exp2((m_i - m_i_new) * LOG2_E)
-        exp_p_adj_minus_m_new = tl.exp2((p_adj_blk - m_i_new) * LOG2_E)
-        if HAS_CAUSAL_MASK: 
-            exp_p_adj_minus_m_new = tl.where(causal_mask, 0.0, exp_p_adj_minus_m_new)
-        key_valid_mask_for_scores = key_valid_mask
-        exp_p_adj_minus_m_new = tl.where(key_valid_mask_for_scores, exp_p_adj_minus_m_new, 0.0)
-        l_i = l_i * exp_diff + tl.sum(exp_p_adj_minus_m_new, axis=1)[:, None]
-        m_i = m_i_new 
-        
-        p_scores_blk = exp_p_adj_minus_m_new
-        o_acc = o_acc * exp_diff + tl.dot(p_scores_blk.to(v_block.dtype), v_block) 
+            prefix_sum = tl.cumsum(sig_blk, 1)
+            row_total = tl.sum(sig_blk, 1)[:, None]
+            z_blk = row_total - prefix_sum + sig_blk + z_running
+            z_running += row_total
 
-        # --- Debug ---
-        # key_valid_mask_store = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
-        # p_raw_out_ptr = P_raw_out + bid * p_raw_out_stride_b + hid * p_raw_out_stride_h + offs_m[:, None] * p_raw_out_stride_m + offs_n[None, :] * p_raw_out_stride_n
-        # sig_ptr       = Sig_P_raw_out + bid * sig_p_raw_out_stride_b + hid * sig_p_raw_out_stride_h + offs_m[:, None] * sig_p_raw_out_stride_m + offs_n[None, :] * sig_p_raw_out_stride_n
-        # z_ptr         = Z_penalty_out + bid * z_penalty_out_stride_b + hid * z_penalty_out_stride_h + offs_m[:, None] * z_penalty_out_stride_m + offs_n[None, :] * z_penalty_out_stride_n
-        #
-        # tl.store(p_raw_out_ptr, p_raw_blk.to(P_raw_out.dtype.element_ty), mask=key_valid_mask_store)
-        # tl.store(sig_ptr,      sig_blk.to(Sig_P_raw_out.dtype.element_ty), mask=key_valid_mask_store)
-        # tl.store(z_ptr,        z_blk.to(Z_penalty_out.dtype.element_ty),    mask=key_valid_mask_store)
+            p_adj_blk = p_raw_blk - z_blk
+            if HAS_CAUSAL_MASK:
+                p_adj_blk = tl.where(causal_mask, causal_mask_value, p_adj_blk)
+            p_adj_blk = tl.where(key_valid_mask, p_adj_blk, causal_mask_value)
+
+            m_i_new = tl.maximum(m_i, tl.max(p_adj_blk, axis=1)[:, None])
+            exp_diff = tl.exp2((m_i - m_i_new) * LOG2_E)
+            exp_scores = tl.exp2((p_adj_blk - m_i_new) * LOG2_E)
+            if HAS_CAUSAL_MASK:
+                exp_scores = tl.where(causal_mask, 0.0, exp_scores)
+            exp_scores = tl.where(key_valid_mask, exp_scores, 0.0)
+            l_i = l_i * exp_diff + tl.sum(exp_scores, axis=1)[:, None]
+            m_i = m_i_new
+
+            o_acc = o_acc * exp_diff + tl.dot(exp_scores.to(v_block.dtype), v_block)
+
+            # --- Debug ---
+            # key_valid_mask_store = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
+            # p_raw_out_ptr = P_raw_out + bid * p_raw_out_stride_b + hid * p_raw_out_stride_h + offs_m[:, None] * p_raw_out_stride_m + offs_n[None, :] * p_raw_out_stride_n
+            # sig_ptr       = Sig_P_raw_out + bid * sig_p_raw_out_stride_b + hid * sig_p_raw_out_stride_h + offs_m[:, None] * sig_p_raw_out_stride_m + offs_n[None, :] * sig_p_raw_out_stride_n
+            # z_ptr         = Z_penalty_out + bid * z_penalty_out_stride_b + hid * z_penalty_out_stride_h + offs_m[:, None] * z_penalty_out_stride_m + offs_n[None, :] * z_penalty_out_stride_n
+            #
+            # tl.store(p_raw_out_ptr, p_raw_blk.to(P_raw_out.dtype.element_ty), mask=key_valid_mask_store)
+            # tl.store(sig_ptr,      sig_blk.to(Sig_P_raw_out.dtype.element_ty), mask=key_valid_mask_store)
+            # tl.store(z_ptr,        z_blk.to(Z_penalty_out.dtype.element_ty),    mask=key_valid_mask_store)
     
     o_blk = o_acc / (l_i + 1e-9) 
 
