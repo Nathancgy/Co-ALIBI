@@ -4,7 +4,6 @@ import triton.language as tl  # type: ignore[import-unresolved]
 LOG2_E = tl.constexpr(1.4426950408889634)
 
 _configs = [
-    # --- Tiles near the best (128,64) but restricted to powers of two ---
     triton.Config({"BLOCK_M": 64,  "BLOCK_N": 32},  num_warps=4, num_stages=4),
     triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},  num_warps=4, num_stages=4),
     triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},  num_warps=8, num_stages=4),
