@@ -94,7 +94,7 @@ class CoALIBIAttention(torch.autograd.Function):
                 except Exception as _e:
                     pass
         
-        ctx.save_for_backward(q, k, v, o, p_raw_for_bwd, sig_p_raw, z_penalty, lse)
+        ctx.save_for_backward(q, k, v, o, lse)
         ctx.sm_scale = sm_scale
         ctx.causal = causal
         ctx.head_dim = head_dim
@@ -104,7 +104,7 @@ class CoALIBIAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, o, p_raw, sig_p_raw, z_penalty, lse = ctx.saved_tensors
+        q, k, v, o, lse = ctx.saved_tensors
         sm_scale = ctx.sm_scale
         causal = ctx.causal
         head_dim = ctx.head_dim
@@ -114,14 +114,18 @@ class CoALIBIAttention(torch.autograd.Function):
         batch_size, num_heads, seq_len_q, _ = q.shape
         _, _, seq_len_kv, _ = k.shape
 
-        dq = torch.empty_like(q)
+        dq = torch.zeros_like(q)
         dk = torch.zeros_like(k, dtype=torch.float32)
         dv = torch.zeros_like(v, dtype=torch.float32)
 
         debug_mode = os.getenv("COALIBI_DEBUG", "0") == "1"
 
-        BLOCK_M_triton = 32
-        BLOCK_N_triton = 64
+        if seq_len_kv > 2048:
+            BLOCK_M_triton = 16
+            BLOCK_N_triton = 32
+        else:
+            BLOCK_M_triton = 32
+            BLOCK_N_triton = 64
         
         if head_dim <= 16: BLOCK_D_triton = 16
         elif head_dim <= 32: BLOCK_D_triton = 32
@@ -134,7 +138,6 @@ class CoALIBIAttention(torch.autograd.Function):
 
         BLOCK_N_KV_triton = BLOCK_N_triton
         BLOCK_DMODEL_triton = BLOCK_D_triton
-        N_CTX_KV_triton = triton.next_power_of_2(seq_len_kv)
 
         grid = (triton.cdiv(seq_len_q, BLOCK_M_triton), batch_size * num_heads)
         num_warps = 4
@@ -142,8 +145,8 @@ class CoALIBIAttention(torch.autograd.Function):
             num_warps = 8
 
         if debug_mode:
-            dp_raw_dbg = torch.empty_like(p_raw, dtype=torch.float32)
-            s_dbg      = torch.empty_like(p_raw, dtype=torch.float32)
+            dp_raw_dbg = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=torch.float32)
+            s_dbg      = torch.empty((batch_size, num_heads, seq_len_q, seq_len_kv), device=q.device, dtype=torch.float32)
         else:
             dp_raw_dbg = torch.empty(1, device=q.device, dtype=torch.float32)
             s_dbg      = torch.empty(1, device=q.device, dtype=torch.float32)

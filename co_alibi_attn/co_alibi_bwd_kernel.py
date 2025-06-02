@@ -1,9 +1,11 @@
 import triton # type: ignore[import-unresolved]
 import triton.language as tl # type: ignore[import-unresolved]
 
+LOG2_E = tl.constexpr(1.4426950408889634)
+
 @triton.jit
 def _sigmoid(x):
-    return 1.0 / (1.0 + tl.exp(-x))
+    return 1.0 / (1.0 + tl.exp2(-x * LOG2_E))
 
 @triton.jit
 def _co_alibi_bwd_kernel(
@@ -52,6 +54,7 @@ def _co_alibi_bwd_kernel(
     dq_acc = tl.zeros((BLOCK_M, BLOCK_DMODEL), dtype=tl.float32)
     row_sig_total = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
 
+    # First pass: compute total sigmoid sum
     for start_n in range(0, seq_len_kv, BLOCK_N_KV):
         offs_n = start_n + tl.arange(0, BLOCK_N_KV)
 
@@ -61,21 +64,25 @@ def _co_alibi_bwd_kernel(
         p_raw = tl.dot(q_blk, k_blk) * sm_scale
 
         causal_mask = offs_m[:, None] < offs_n[None, :]
+        valid_mask = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
+        
+        # Apply masks for sigmoid computation with numerical stability
+        p_raw_for_sig = p_raw
         if HAS_CAUSAL_MASK:
-            p_raw = tl.where(causal_mask, -float('inf'), p_raw)
-
-        sig = _sigmoid(p_raw)
+            p_raw_for_sig = tl.where(causal_mask, -float('inf'), p_raw_for_sig)  # Match forward kernel
+        
+        sig = _sigmoid(p_raw_for_sig)
         if HAS_CAUSAL_MASK:
             sig = tl.where(causal_mask, 0.0, sig)
-
-        valid_mask = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
         sig = tl.where(valid_mask, sig, 0.0)
+        
         row_sig_total += tl.sum(sig.to(tl.float32), axis=1)[:, None]
 
     row_ds_s_total = tl.sum(do_blk.to(tl.float32) * o_blk.to(tl.float32), axis=1)[:, None]
     prefix_sig_sum_row = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
     prefix_dp_adj_row  = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
 
+    # Second pass: compute gradients with correct z_penalty computation
     for start_n in range(0, seq_len_kv, BLOCK_N_KV):
         offs_n = start_n + tl.arange(0, BLOCK_N_KV)
         k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[None, :] * k_stride_n + offs_d[:, None] * k_stride_k
@@ -85,27 +92,43 @@ def _co_alibi_bwd_kernel(
 
         p_raw = tl.dot(q_blk, k_blk) * sm_scale  # (M,N)
         causal_mask = offs_m[:, None] < offs_n[None, :]
+        valid_mask = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
+        
+        # Compute sigmoid with numerical stability for gradient computation
+        p_raw_for_sig = p_raw
         if HAS_CAUSAL_MASK:
-            p_raw = tl.where(causal_mask, -float('inf'), p_raw)
-
-        sig = _sigmoid(p_raw)
+            p_raw_for_sig = tl.where(causal_mask, -float('inf'), p_raw_for_sig)  # Match forward kernel
+            
+        sig = _sigmoid(p_raw_for_sig)
         if HAS_CAUSAL_MASK:
             sig = tl.where(causal_mask, 0.0, sig)
-
-        valid_mask = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
         sig = tl.where(valid_mask, sig, 0.0)
         sig_f32 = sig.to(tl.float32)
 
+        # Compute z_penalty as reverse cumsum
+        # z_penalty[i,j] = sum(sig[i,k] for k >= j)  # Note: includes j
+        # = row_sig_total[i] - sum(sig[i,k] for k < j)
+        # = row_sig_total[i] - (prefix_sig_sum_row[i] + cumsum(sig[i,:j-1]))
         prefix_sig_local = tl.cumsum(sig_f32, axis=1)
-        z_penalty = row_sig_total - (prefix_sig_sum_row + prefix_sig_local) + sig_f32
+        # prefix_sig_local[j] includes sig[j], so we need to adjust
+        z_penalty = row_sig_total - prefix_sig_sum_row - prefix_sig_local + sig_f32
         prefix_sig_sum_row += tl.sum(sig_f32, axis=1)[:, None]
 
-        p_adj = p_raw - z_penalty
+        # Apply causal mask to p_raw before computing p_adj
         if HAS_CAUSAL_MASK:
-            p_adj = tl.where(causal_mask, causal_mask_value, p_adj)
-        p_adj = tl.where(valid_mask, p_adj, causal_mask_value)
+            p_raw = tl.where(causal_mask, causal_mask_value, p_raw)
+        p_raw = tl.where(valid_mask, p_raw, causal_mask_value)
 
-        s = tl.exp(p_adj - lse_row)
+        p_adj = p_raw - z_penalty
+        
+        # No need to re-mask p_adj since p_raw is already masked
+        # Use numerically stable computation for s
+        # s = exp(p_adj - lse_row) = exp(p_raw - z_penalty - lse_row)
+        # To prevent underflow, clamp the exponent
+        log_s = p_adj - lse_row
+        log_s = tl.maximum(log_s, -50.0)  # Prevent extreme underflow
+        s = tl.exp(log_s)
+        
         if HAS_CAUSAL_MASK:
             s = tl.where(causal_mask, 0.0, s)
         s = tl.where(valid_mask, s, 0.0)
@@ -113,6 +136,7 @@ def _co_alibi_bwd_kernel(
         dv_contrib = tl.dot(tl.trans(s.to(tl.float32)), do_blk.to(tl.float32))
         dv_ptrs = DV + bid * dv_stride_b + hid * dv_stride_h + offs_n[:, None] * dv_stride_n + offs_d[None, :] * dv_stride_d
         tl.atomic_add(dv_ptrs, dv_contrib.to(DV.dtype.element_ty), mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim))
+        
         ds = tl.dot(do_blk.to(tl.float32), tl.trans(v_blk.to(tl.float32)))
         dp_adj = s.to(tl.float32) * (ds - row_ds_s_total)
 
@@ -120,7 +144,13 @@ def _co_alibi_bwd_kernel(
             dp_adj = tl.where(causal_mask, 0.0, dp_adj)
         dp_adj = tl.where(valid_mask, dp_adj, 0.0)
 
-        sigma_prime = sig.to(tl.float32) * (1.0 - sig.to(tl.float32))
+        # Compute gradient through z_penalty
+        # dL/dp_raw = dp_adj - sigma'(p_raw) * sum(dp_adj[k] for k < current)
+        sigma_prime = sig_f32 * (1.0 - sig_f32)
+        # Clamp sigma_prime to prevent numerical issues with extreme sigmoid values
+        sigma_prime = tl.minimum(sigma_prime, 0.25)  # Max value of sigmoid derivative is 0.25
+        
+        # Accumulate dp_adj for future blocks
         prefix_dp_local = tl.cumsum(dp_adj, axis=1)
         c_block = prefix_dp_adj_row + prefix_dp_local
         prefix_dp_adj_row += tl.sum(dp_adj, axis=1)[:, None]

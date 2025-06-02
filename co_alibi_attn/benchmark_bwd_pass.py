@@ -8,10 +8,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from co_alibi_attn import co_alibi_attention
 
-# ---------------- Reference implementation ------------------------------------
-
 def ref_forward(q, k, v, scale_factor):
-    """Pure-PyTorch forward pass (no Triton) following the paper exactly."""
     B, H, M, _ = q.shape
     N = k.shape[2]
 
@@ -30,8 +27,6 @@ def ref_forward(q, k, v, scale_factor):
     out = torch.einsum("bhmn,bhnd->bhmd", s, v)
     return out, (p_raw.detach(), sig.detach(), z_penalty.detach(), s.detach())
 
-# ------------------------------------------------------------------------------
-
 def first_mismatch(a: torch.Tensor, b: torch.Tensor, atol=1e-3, rtol=5e-3):
     diff = torch.abs(a - b)
     mask = diff > (atol + rtol * torch.abs(b))
@@ -44,9 +39,8 @@ def first_mismatch(a: torch.Tensor, b: torch.Tensor, atol=1e-3, rtol=5e-3):
 def main():
     torch.manual_seed(0)
 
-    # Config ------------------------------------------------------------------
-    B, H, S, D = 4, 8, 256, 64  # keep manageable for grad-check
-    dtype = torch.float32  # use fp32 for strict checks
+    B, H, S, D = 1, 16, 1024, 128
+    dtype = torch.float32
     device = "cuda"
 
     q = torch.randn(B, H, S, D, device=device, dtype=dtype, requires_grad=True)
@@ -55,25 +49,20 @@ def main():
 
     scale = 1.0 / math.sqrt(D)
 
-    # ---------------- Reference fwd+bwd -------------------------------------
     out_ref, ref_intermediates = ref_forward(q, k, v, scale)
     dout = torch.randn_like(out_ref)
     out_ref.backward(dout)
     dq_ref, dk_ref, dv_ref = q.grad.detach(), k.grad.detach(), v.grad.detach()
 
-    # Reset grads -------------------------------------------------------------
     q.grad = k.grad = v.grad = None
 
-    # ---------------- Triton fwd+bwd ----------------------------------------
     out_tri = co_alibi_attention(q, k, v, causal=True, sm_scale=scale)
     out_tri.backward(dout)
     dq_tri, dk_tri, dv_tri = q.grad.detach(), k.grad.detach(), v.grad.detach()
 
-    # ---------------- Optional debug comparisons ---------------------------
     if os.getenv("COALIBI_DEBUG", "0") == "1":
         from co_alibi_attn import debug_dp_raw, debug_s
 
-        # Recompute reference intermediates needed for gradients -------------
         p_raw_ref, sig_ref, z_penalty_ref, s_ref = ref_intermediates
         sigma_prime_ref = sig_ref * (1.0 - sig_ref)
 
