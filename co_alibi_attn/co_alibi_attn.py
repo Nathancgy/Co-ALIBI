@@ -21,7 +21,6 @@ class CoALIBIAttention(torch.autograd.Function):
         o = torch.empty_like(q)
         
         if use_simplified_kernel:
-            # Dummy 1-element tensors – simplified kernel doesn't store debug info.
             p_raw_for_bwd = torch.empty(1, device=q.device, dtype=q.dtype)
             sig_p_raw    = torch.empty(1, device=q.device, dtype=q.dtype)
             z_penalty    = torch.empty(1, device=q.device, dtype=q.dtype)
@@ -32,25 +31,6 @@ class CoALIBIAttention(torch.autograd.Function):
         lse = torch.empty((batch_size, num_heads, seq_len_q), device=q.device, dtype=torch.float32)
 
         causal_mask_value_fwd = -torch.finfo(torch.float32).max 
-
-        if not use_simplified_kernel:
-            BLOCK_M_triton = 32
-            BLOCK_N_triton = 64
-
-            if head_dim <= 16: BLOCK_D_triton = 16
-            elif head_dim <= 32: BLOCK_D_triton = 32
-            elif head_dim <= 64: BLOCK_D_triton = 64
-            elif head_dim <= 128: BLOCK_D_triton = 128
-            else:
-                BLOCK_D_triton = 128
-            if head_dim in [16, 32, 64, 128]:
-                BLOCK_D_triton = head_dim
-
-            kv_blocks = (seq_len_kv + BLOCK_N_triton - 1) // BLOCK_N_triton
-            grid = (triton.cdiv(seq_len_q, BLOCK_M_triton), batch_size * num_heads)
-
-            num_warps_kernel = 8 if (BLOCK_M_triton >= 128 or BLOCK_N_triton >= 128) else 4
-            num_stages_kernel = 4
 
         if use_simplified_kernel:
             def grid(meta):
