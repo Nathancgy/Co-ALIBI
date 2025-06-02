@@ -1,42 +1,24 @@
 import triton  # type: ignore[import-unresolved]
 import triton.language as tl  # type: ignore[import-unresolved]
-import math  # needed only for documentation clarity (no runtime use)
 
 LOG2_E = tl.constexpr(1.4426950408889634)
 
-# ---------------- Autotune configurations ----------------
-# To improve performance on large sequence lengths (e.g., 4k) while avoiding
-# register spilling, we keep the tile sizes relatively small. Six hand-picked
-# configurations are provided for Triton to autotune over. These configs vary
-# the sequence tile sizes (BLOCK_M, BLOCK_N), number of warps and pipeline
-# stages — a good starting point for balancing arithmetic intensity and memory
-# pressure for Co-ALIBI's heavier register usage.
 _configs = [
-    # --- Small baseline tiles ---
-    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 64},   num_warps=4, num_stages=4),
-    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 64},   num_warps=4, num_stages=6),
-    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 128},  num_warps=4, num_stages=4),
-    triton.Config({"BLOCK_M": 32,  "BLOCK_N": 128},  num_warps=4, num_stages=6),
+    # --- Tiles near the best (128,64) but restricted to powers of two ---
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 32},  num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},  num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},  num_warps=8, num_stages=4),
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128}, num_warps=8, num_stages=4),
 
-    # --- Medium tiles with taller query chunk ---
-    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 32},   num_warps=4, num_stages=4),
-    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 32},   num_warps=4, num_stages=6),
-    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},   num_warps=4, num_stages=4),
-    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 64},   num_warps=4, num_stages=6),
-    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128},  num_warps=4, num_stages=4),
-    triton.Config({"BLOCK_M": 64,  "BLOCK_N": 128},  num_warps=8, num_stages=4),
-
-    # --- Larger tiles: keep within register limits ---
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32},   num_warps=4, num_stages=4),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32},   num_warps=4, num_stages=6),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},   num_warps=8, num_stages=4),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},   num_warps=8, num_stages=6),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128},  num_warps=8, num_stages=4),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128},  num_warps=8, num_stages=6),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32},  num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},  num_warps=8, num_stages=4),  # current best
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},  num_warps=8, num_stages=6),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=6),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32},  num_warps=8, num_stages=4),
 ]
 
 def _prune_configs(configs, named_args, **kwargs):
-    """Prune configs that would overshoot the actual sequence length."""
     seq_len_q = kwargs.get("seq_len_q", 0)
     return [cfg for cfg in configs if cfg.kwargs["BLOCK_M"] <= seq_len_q]
 
@@ -79,7 +61,6 @@ def _co_alibi_fwd_kernel(
     o_acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
     z_running = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
 
-    # Compute the number of key/value tiles this kernel will iterate over.
     KV_BLOCKS = (seq_len_kv + BLOCK_N - 1) // BLOCK_N
 
     for blk_idx_from_right in tl.range(KV_BLOCKS):
@@ -130,16 +111,6 @@ def _co_alibi_fwd_kernel(
 
             o_acc = o_acc * exp_diff + tl.dot(exp_scores.to(v_block.dtype), v_block)
 
-            # --- Debug ---
-            # key_valid_mask_store = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
-            # p_raw_out_ptr = P_raw_out + bid * p_raw_out_stride_b + hid * p_raw_out_stride_h + offs_m[:, None] * p_raw_out_stride_m + offs_n[None, :] * p_raw_out_stride_n
-            # sig_ptr       = Sig_P_raw_out + bid * sig_p_raw_out_stride_b + hid * sig_p_raw_out_stride_h + offs_m[:, None] * sig_p_raw_out_stride_m + offs_n[None, :] * sig_p_raw_out_stride_n
-            # z_ptr         = Z_penalty_out + bid * z_penalty_out_stride_b + hid * z_penalty_out_stride_h + offs_m[:, None] * z_penalty_out_stride_m + offs_n[None, :] * z_penalty_out_stride_n
-            #
-            # tl.store(p_raw_out_ptr, p_raw_blk.to(P_raw_out.dtype.element_ty), mask=key_valid_mask_store)
-            # tl.store(sig_ptr,      sig_blk.to(Sig_P_raw_out.dtype.element_ty), mask=key_valid_mask_store)
-            # tl.store(z_ptr,        z_blk.to(Z_penalty_out.dtype.element_ty),    mask=key_valid_mask_store)
-    
     o_blk = o_acc / (l_i + 1e-9) 
 
     out_ptrs = Out + bid * out_stride_b + hid * out_stride_h + offs_m[:, None] * out_stride_m + offs_d[None, :] * out_stride_d
