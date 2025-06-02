@@ -23,9 +23,22 @@ def _co_alibi_bwd_kernel(
     dk_stride_b, dk_stride_h, dk_stride_n, dk_stride_k,
     dv_stride_b, dv_stride_h, dv_stride_n, dv_stride_d,
     o_stride_b, o_stride_h, o_stride_m, o_stride_d,
-    DP_RAW_OUT, S_OUT,
+    DP_RAW_OUT, S_OUT, DP_ADJ_OUT, SIG_PRIME_OUT, C_BLOCK_OUT, SIG_F32_OUT,
+    S2_OUT, Z2_OUT, Z_OUT,
+    SIG2_OUT,
+    P_RAW_PASS2_OUT, P_RAW_PASS3_OUT,
+    s2_out_stride_b, s2_out_stride_h, s2_out_stride_m, s2_out_stride_n,
+    sig2_out_stride_b, sig2_out_stride_h, sig2_out_stride_m, sig2_out_stride_n,
+    z2_out_stride_b, z2_out_stride_h, z2_out_stride_m, z2_out_stride_n,
+    z_out_stride_b,  z_out_stride_h,  z_out_stride_m,  z_out_stride_n,
     dp_raw_out_stride_b, dp_raw_out_stride_h, dp_raw_out_stride_m, dp_raw_out_stride_n,
     s_out_stride_b, s_out_stride_h, s_out_stride_m, s_out_stride_n,
+    dp_adj_out_stride_b, dp_adj_out_stride_h, dp_adj_out_stride_m, dp_adj_out_stride_n,
+    sig_prime_out_stride_b, sig_prime_out_stride_h, sig_prime_out_stride_m, sig_prime_out_stride_n,
+    c_block_out_stride_b, c_block_out_stride_h, c_block_out_stride_m, c_block_out_stride_n,
+    sig_f32_out_stride_b, sig_f32_out_stride_h, sig_f32_out_stride_m, sig_f32_out_stride_n,
+    p_raw_pass2_out_stride_b, p_raw_pass2_out_stride_h, p_raw_pass2_out_stride_m, p_raw_pass2_out_stride_n,
+    p_raw_pass3_out_stride_b, p_raw_pass3_out_stride_h, p_raw_pass3_out_stride_m, p_raw_pass3_out_stride_n,
     batch_size, num_heads, seq_len_q, seq_len_kv, head_dim,
     HAS_CAUSAL_MASK: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N_KV: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
@@ -54,11 +67,8 @@ def _co_alibi_bwd_kernel(
     dq_acc = tl.zeros((BLOCK_M, BLOCK_DMODEL), dtype=tl.float32)
     row_sig_total = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
 
-    # First pass: compute total sigmoid sum
     for start_n in range(0, seq_len_kv, BLOCK_N_KV):
         offs_n = start_n + tl.arange(0, BLOCK_N_KV)
-
-        # Load K tile (D, N)
         k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[None, :] * k_stride_n + offs_d[:, None] * k_stride_k
         k_blk  = tl.load(k_ptrs, mask=(offs_n[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim), other=0.0)
         p_raw = tl.dot(q_blk, k_blk) * sm_scale
@@ -66,10 +76,9 @@ def _co_alibi_bwd_kernel(
         causal_mask = offs_m[:, None] < offs_n[None, :]
         valid_mask = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
         
-        # Apply masks for sigmoid computation with numerical stability
         p_raw_for_sig = p_raw
         if HAS_CAUSAL_MASK:
-            p_raw_for_sig = tl.where(causal_mask, -float('inf'), p_raw_for_sig)  # Match forward kernel
+            p_raw_for_sig = tl.where(causal_mask, -float('inf'), p_raw_for_sig)
         
         sig = _sigmoid(p_raw_for_sig)
         if HAS_CAUSAL_MASK:
@@ -78,79 +87,132 @@ def _co_alibi_bwd_kernel(
         
         row_sig_total += tl.sum(sig.to(tl.float32), axis=1)[:, None]
 
-    row_ds_s_total = tl.sum(do_blk.to(tl.float32) * o_blk.to(tl.float32), axis=1)[:, None]
-    prefix_sig_sum_row = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
-    prefix_dp_adj_row  = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
+    # ------------------------------------------------------------
+    # SECOND PASS: Compute correct D_t (row_ds_s_total) and dV.
+    # ------------------------------------------------------------
+    row_ds_s_total = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
+    prefix_sig_sum_row_pass2 = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
 
-    # Second pass: compute gradients with correct z_penalty computation
     for start_n in range(0, seq_len_kv, BLOCK_N_KV):
         offs_n = start_n + tl.arange(0, BLOCK_N_KV)
+
+        # Load K and V tiles
+        
         k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[None, :] * k_stride_n + offs_d[:, None] * k_stride_k
         k_blk  = tl.load(k_ptrs, mask=(offs_n[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim), other=0.0)
         v_ptrs = V + bid * v_stride_b + hid * v_stride_h + offs_n[:, None] * v_stride_n + offs_d[None, :] * v_stride_d
         v_blk  = tl.load(v_ptrs, mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim), other=0.0)
 
-        p_raw = tl.dot(q_blk, k_blk) * sm_scale  # (M,N)
+        # Recompute p_raw, masks and sigmoid
+        p_raw = tl.dot(q_blk, k_blk) * sm_scale  # (M, N)
         causal_mask = offs_m[:, None] < offs_n[None, :]
-        valid_mask = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
-        
-        # Compute sigmoid with numerical stability for gradient computation
+        valid_mask  = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
+
+        if DEBUG: # Store p_raw for pass 2
+            p_raw_pass2_out_ptr = P_RAW_PASS2_OUT + bid * p_raw_pass2_out_stride_b + hid * p_raw_pass2_out_stride_h + offs_m[:, None] * p_raw_pass2_out_stride_m + offs_n[None, :] * p_raw_pass2_out_stride_n
+            tl.store(p_raw_pass2_out_ptr, p_raw, mask=valid_mask)
+
         p_raw_for_sig = p_raw
         if HAS_CAUSAL_MASK:
-            p_raw_for_sig = tl.where(causal_mask, -float('inf'), p_raw_for_sig)  # Match forward kernel
-            
+            p_raw_for_sig = tl.where(causal_mask, -float('inf'), p_raw_for_sig)
+
         sig = _sigmoid(p_raw_for_sig)
         if HAS_CAUSAL_MASK:
             sig = tl.where(causal_mask, 0.0, sig)
         sig = tl.where(valid_mask, sig, 0.0)
         sig_f32 = sig.to(tl.float32)
 
-        # Compute z_penalty as reverse cumsum
-        # z_penalty[i,j] = sum(sig[i,k] for k >= j)  # Note: includes j
-        # = row_sig_total[i] - sum(sig[i,k] for k < j)
-        # = row_sig_total[i] - (prefix_sig_sum_row[i] + cumsum(sig[i,:j-1]))
+        # z_penalty components to obtain p_adj
         prefix_sig_local = tl.cumsum(sig_f32, axis=1)
-        # prefix_sig_local[j] includes sig[j], so we need to adjust
-        z_penalty = row_sig_total - prefix_sig_sum_row - prefix_sig_local + sig_f32
-        prefix_sig_sum_row += tl.sum(sig_f32, axis=1)[:, None]
+        z_penalty = row_sig_total - prefix_sig_sum_row_pass2 - prefix_sig_local + sig_f32
+        prefix_sig_sum_row_pass2 += tl.sum(sig_f32, axis=1)[:, None]
 
-        # Apply causal mask to p_raw before computing p_adj
+        # Build p_adj and S tile
         if HAS_CAUSAL_MASK:
             p_raw = tl.where(causal_mask, causal_mask_value, p_raw)
         p_raw = tl.where(valid_mask, p_raw, causal_mask_value)
 
         p_adj = p_raw - z_penalty
-        
-        # No need to re-mask p_adj since p_raw is already masked
-        # Use numerically stable computation for s
-        # s = exp(p_adj - lse_row) = exp(p_raw - z_penalty - lse_row)
-        # To prevent underflow, clamp the exponent
         log_s = p_adj - lse_row
-        log_s = tl.maximum(log_s, -50.0)  # Prevent extreme underflow
         s = tl.exp(log_s)
-        
         if HAS_CAUSAL_MASK:
             s = tl.where(causal_mask, 0.0, s)
         s = tl.where(valid_mask, s, 0.0)
 
+        if DEBUG:
+            s2_out_ptr = S2_OUT + bid * s2_out_stride_b + hid * s2_out_stride_h + offs_m[:, None] * s2_out_stride_m + offs_n[None, :] * s2_out_stride_n
+            sig2_out_ptr = SIG2_OUT + bid * sig2_out_stride_b + hid * sig2_out_stride_h + offs_m[:, None] * sig2_out_stride_m + offs_n[None, :] * sig2_out_stride_n
+            z2_out_ptr = Z2_OUT + bid * z2_out_stride_b + hid * z2_out_stride_h + offs_m[:, None] * z2_out_stride_m + offs_n[None, :] * z2_out_stride_n
+            tl.store(s2_out_ptr, s, mask=valid_mask)
+            tl.store(sig2_out_ptr, sig_f32, mask=valid_mask)
+            tl.store(z2_out_ptr, z_penalty, mask=valid_mask)
+
+        # --- dV accumulation (same as original) ---
         dv_contrib = tl.dot(tl.trans(s.to(tl.float32)), do_blk.to(tl.float32))
         dv_ptrs = DV + bid * dv_stride_b + hid * dv_stride_h + offs_n[:, None] * dv_stride_n + offs_d[None, :] * dv_stride_d
         tl.atomic_add(dv_ptrs, dv_contrib.to(DV.dtype.element_ty), mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim))
-        
-        ds = tl.dot(do_blk.to(tl.float32), tl.trans(v_blk.to(tl.float32)))
-        dp_adj = s.to(tl.float32) * (ds - row_ds_s_total)
 
+        # --- Correct D_t accumulation ---
+        ds = tl.dot(do_blk.to(tl.float32), tl.trans(v_blk.to(tl.float32)))  # (M, N)
+        row_ds_s_total += tl.sum(s.to(tl.float32) * ds, axis=1)[:, None]
+
+    prefix_sig_sum_row = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
+    prefix_dp_adj_row  = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
+
+    for start_n in range(0, seq_len_kv, BLOCK_N_KV):
+        offs_n = start_n + tl.arange(0, BLOCK_N_KV)
+
+        # Load tiles
+        k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[None, :] * k_stride_n + offs_d[:, None] * k_stride_k
+        k_blk  = tl.load(k_ptrs, mask=(offs_n[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim), other=0.0)
+        v_ptrs = V + bid * v_stride_b + hid * v_stride_h + offs_n[:, None] * v_stride_n + offs_d[None, :] * v_stride_d
+        v_blk  = tl.load(v_ptrs, mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim), other=0.0)
+
+        p_raw = tl.dot(q_blk, k_blk) * sm_scale
+        causal_mask = offs_m[:, None] < offs_n[None, :]
+        valid_mask  = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
+
+        if DEBUG: # Store p_raw for pass 3
+            p_raw_pass3_out_ptr = P_RAW_PASS3_OUT + bid * p_raw_pass3_out_stride_b + hid * p_raw_pass3_out_stride_h + offs_m[:, None] * p_raw_pass3_out_stride_m + offs_n[None, :] * p_raw_pass3_out_stride_n
+            tl.store(p_raw_pass3_out_ptr, p_raw, mask=valid_mask)
+
+        p_raw_for_sig = p_raw
+        if HAS_CAUSAL_MASK:
+            p_raw_for_sig = tl.where(causal_mask, -float('inf'), p_raw_for_sig)
+
+        sig = _sigmoid(p_raw_for_sig)
+        if HAS_CAUSAL_MASK:
+            sig = tl.where(causal_mask, 0.0, sig)
+        sig = tl.where(valid_mask, sig, 0.0)
+        sig_f32 = sig.to(tl.float32)
+
+        prefix_sig_local = tl.cumsum(sig_f32, axis=1)
+        z_penalty = row_sig_total - prefix_sig_sum_row - prefix_sig_local + sig_f32
+        prefix_sig_sum_row += tl.sum(sig_f32, axis=1)[:, None]
+
+        if HAS_CAUSAL_MASK:
+            p_raw = tl.where(causal_mask, causal_mask_value, p_raw)
+        p_raw = tl.where(valid_mask, p_raw, causal_mask_value)
+
+        p_adj = p_raw - z_penalty
+        log_s = p_adj - lse_row
+        s = tl.exp(log_s)
+        if HAS_CAUSAL_MASK:
+            s = tl.where(causal_mask, 0.0, s)
+        s = tl.where(valid_mask, s, 0.0)
+
+        # --- Recompute ds for this tile ---
+        ds = tl.dot(do_blk.to(tl.float32), tl.trans(v_blk.to(tl.float32)))
+
+        dp_adj = s.to(tl.float32) * (ds - row_ds_s_total)
         if HAS_CAUSAL_MASK:
             dp_adj = tl.where(causal_mask, 0.0, dp_adj)
         dp_adj = tl.where(valid_mask, dp_adj, 0.0)
 
-        # Compute gradient through z_penalty
-        # dL/dp_raw = dp_adj - sigma'(p_raw) * sum(dp_adj[k] for k < current)
+        # Sigma-prime and cumulative blocking (same as before)
         sigma_prime = sig_f32 * (1.0 - sig_f32)
-        # Clamp sigma_prime to prevent numerical issues with extreme sigmoid values
-        sigma_prime = tl.minimum(sigma_prime, 0.25)  # Max value of sigmoid derivative is 0.25
-        
-        # Accumulate dp_adj for future blocks
+        sigma_prime = tl.minimum(sigma_prime, 0.25)
+
         prefix_dp_local = tl.cumsum(dp_adj, axis=1)
         c_block = prefix_dp_adj_row + prefix_dp_local
         prefix_dp_adj_row += tl.sum(dp_adj, axis=1)[:, None]
@@ -163,13 +225,29 @@ def _co_alibi_bwd_kernel(
         if DEBUG:
             dp_raw_out_ptr = DP_RAW_OUT + bid * dp_raw_out_stride_b + hid * dp_raw_out_stride_h + offs_m[:, None] * dp_raw_out_stride_m + offs_n[None, :] * dp_raw_out_stride_n
             s_out_ptr      = S_OUT      + bid * s_out_stride_b      + hid * s_out_stride_h      + offs_m[:, None] * s_out_stride_m      + offs_n[None, :] * s_out_stride_n
+            z_out_ptr      = Z_OUT      + bid * z_out_stride_b      + hid * z_out_stride_h      + offs_m[:, None] * z_out_stride_m      + offs_n[None, :] * z_out_stride_n
             tl.store(dp_raw_out_ptr, dp_raw, mask=valid_mask)
             tl.store(s_out_ptr,      s,      mask=valid_mask)
+            tl.store(z_out_ptr,      z_penalty, mask=valid_mask)
 
+            dp_adj_out_ptr = DP_ADJ_OUT + bid * dp_adj_out_stride_b + hid * dp_adj_out_stride_h + offs_m[:, None] * dp_adj_out_stride_m + offs_n[None, :] * dp_adj_out_stride_n
+            sig_prime_out_ptr = SIG_PRIME_OUT + bid * sig_prime_out_stride_b + hid * sig_prime_out_stride_h + offs_m[:, None] * sig_prime_out_stride_m + offs_n[None, :] * sig_prime_out_stride_n
+            c_block_out_ptr = C_BLOCK_OUT + bid * c_block_out_stride_b + hid * c_block_out_stride_h + offs_m[:, None] * c_block_out_stride_m + offs_n[None, :] * c_block_out_stride_n
+            sig_f32_out_ptr = SIG_F32_OUT + bid * sig_f32_out_stride_b + hid * sig_f32_out_stride_h + offs_m[:, None] * sig_f32_out_stride_m + offs_n[None, :] * sig_f32_out_stride_n
+            tl.store(dp_adj_out_ptr, dp_adj, mask=valid_mask)
+            tl.store(sig_prime_out_ptr, sigma_prime, mask=valid_mask)
+            tl.store(c_block_out_ptr, c_block, mask=valid_mask)
+            tl.store(sig_f32_out_ptr, sig_f32, mask=valid_mask)
+
+        # --- dK and dQ ---
         dk_contrib = tl.dot(tl.trans(dp_raw * sm_scale), q_blk.to(tl.float32))
         dk_ptrs = DK + bid * dk_stride_b + hid * dk_stride_h + offs_n[:, None] * dk_stride_n + offs_d[None, :] * dk_stride_k
         tl.atomic_add(dk_ptrs, dk_contrib.to(DK.dtype.element_ty), mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim))
+
         dq_acc += tl.dot(dp_raw * sm_scale, tl.trans(k_blk.to(tl.float32)))
 
+    # Store dQ
     dq_ptrs = DQ + bid * dq_stride_b + hid * dq_stride_h + offs_m[:, None] * dq_stride_m + offs_d[None, :] * dq_stride_k
-    tl.store(dq_ptrs, dq_acc.to(DQ.dtype.element_ty), mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim)) 
+    tl.store(dq_ptrs, dq_acc.to(DQ.dtype.element_ty), mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim))
+
+    # (removed duplicate debug storage after loop) 
