@@ -67,6 +67,10 @@ def _co_alibi_bwd_kernel(
     dq_acc = tl.zeros((BLOCK_M, BLOCK_DMODEL), dtype=tl.float32)
     row_sig_total = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
 
+    # ------------------------------------------------------------
+    # FIRST PASS
+    # ------------------------------------------------------------
+
     for start_n in range(0, seq_len_kv, BLOCK_N_KV):
         offs_n = start_n + tl.arange(0, BLOCK_N_KV)
         k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[None, :] * k_stride_n + offs_d[:, None] * k_stride_k
@@ -88,15 +92,13 @@ def _co_alibi_bwd_kernel(
         row_sig_total += tl.sum(sig.to(tl.float32), axis=1)[:, None]
 
     # ------------------------------------------------------------
-    # SECOND PASS: Compute correct D_t (row_ds_s_total) and dV.
+    # SECOND PASS
     # ------------------------------------------------------------
     row_ds_s_total = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
     prefix_sig_sum_row_pass2 = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
 
     for start_n in range(0, seq_len_kv, BLOCK_N_KV):
         offs_n = start_n + tl.arange(0, BLOCK_N_KV)
-
-        # Load K and V tiles
         
         k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[None, :] * k_stride_n + offs_d[:, None] * k_stride_k
         k_blk  = tl.load(k_ptrs, mask=(offs_n[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim), other=0.0)
@@ -122,12 +124,10 @@ def _co_alibi_bwd_kernel(
         sig = tl.where(valid_mask, sig, 0.0)
         sig_f32 = sig.to(tl.float32)
 
-        # z_penalty components to obtain p_adj
         prefix_sig_local = tl.cumsum(sig_f32, axis=1)
         z_penalty = row_sig_total - prefix_sig_sum_row_pass2 - prefix_sig_local + sig_f32
         prefix_sig_sum_row_pass2 += tl.sum(sig_f32, axis=1)[:, None]
 
-        # Build p_adj and S tile
         if HAS_CAUSAL_MASK:
             p_raw = tl.where(causal_mask, causal_mask_value, p_raw)
         p_raw = tl.where(valid_mask, p_raw, causal_mask_value)
@@ -147,14 +147,16 @@ def _co_alibi_bwd_kernel(
             tl.store(sig2_out_ptr, sig_f32, mask=valid_mask)
             tl.store(z2_out_ptr, z_penalty, mask=valid_mask)
 
-        # --- dV accumulation (same as original) ---
         dv_contrib = tl.dot(tl.trans(s.to(tl.float32)), do_blk.to(tl.float32))
         dv_ptrs = DV + bid * dv_stride_b + hid * dv_stride_h + offs_n[:, None] * dv_stride_n + offs_d[None, :] * dv_stride_d
         tl.atomic_add(dv_ptrs, dv_contrib.to(DV.dtype.element_ty), mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim))
 
-        # --- Correct D_t accumulation ---
         ds = tl.dot(do_blk.to(tl.float32), tl.trans(v_blk.to(tl.float32)))  # (M, N)
         row_ds_s_total += tl.sum(s.to(tl.float32) * ds, axis=1)[:, None]
+
+    # ------------------------------------------------------------
+    # THIRD PASS
+    # ------------------------------------------------------------
 
     prefix_sig_sum_row = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
     prefix_dp_adj_row  = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
@@ -162,7 +164,6 @@ def _co_alibi_bwd_kernel(
     for start_n in range(0, seq_len_kv, BLOCK_N_KV):
         offs_n = start_n + tl.arange(0, BLOCK_N_KV)
 
-        # Load tiles
         k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[None, :] * k_stride_n + offs_d[:, None] * k_stride_k
         k_blk  = tl.load(k_ptrs, mask=(offs_n[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim), other=0.0)
         v_ptrs = V + bid * v_stride_b + hid * v_stride_h + offs_n[:, None] * v_stride_n + offs_d[None, :] * v_stride_d
@@ -172,7 +173,7 @@ def _co_alibi_bwd_kernel(
         causal_mask = offs_m[:, None] < offs_n[None, :]
         valid_mask  = (offs_m[:, None] < seq_len_q) & (offs_n[None, :] < seq_len_kv)
 
-        if DEBUG: # Store p_raw for pass 3
+        if DEBUG:
             p_raw_pass3_out_ptr = P_RAW_PASS3_OUT + bid * p_raw_pass3_out_stride_b + hid * p_raw_pass3_out_stride_h + offs_m[:, None] * p_raw_pass3_out_stride_m + offs_n[None, :] * p_raw_pass3_out_stride_n
             tl.store(p_raw_pass3_out_ptr, p_raw, mask=valid_mask)
 
@@ -201,7 +202,6 @@ def _co_alibi_bwd_kernel(
             s = tl.where(causal_mask, 0.0, s)
         s = tl.where(valid_mask, s, 0.0)
 
-        # --- Recompute ds for this tile ---
         ds = tl.dot(do_blk.to(tl.float32), tl.trans(v_blk.to(tl.float32)))
 
         dp_adj = s.to(tl.float32) * (ds - row_ds_s_total)
@@ -209,7 +209,6 @@ def _co_alibi_bwd_kernel(
             dp_adj = tl.where(causal_mask, 0.0, dp_adj)
         dp_adj = tl.where(valid_mask, dp_adj, 0.0)
 
-        # Sigma-prime and cumulative blocking (same as before)
         sigma_prime = sig_f32 * (1.0 - sig_f32)
         sigma_prime = tl.minimum(sigma_prime, 0.25)
 
@@ -239,15 +238,11 @@ def _co_alibi_bwd_kernel(
             tl.store(c_block_out_ptr, c_block, mask=valid_mask)
             tl.store(sig_f32_out_ptr, sig_f32, mask=valid_mask)
 
-        # --- dK and dQ ---
         dk_contrib = tl.dot(tl.trans(dp_raw * sm_scale), q_blk.to(tl.float32))
         dk_ptrs = DK + bid * dk_stride_b + hid * dk_stride_h + offs_n[:, None] * dk_stride_n + offs_d[None, :] * dk_stride_k
         tl.atomic_add(dk_ptrs, dk_contrib.to(DK.dtype.element_ty), mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim))
 
         dq_acc += tl.dot(dp_raw * sm_scale, tl.trans(k_blk.to(tl.float32)))
 
-    # Store dQ
     dq_ptrs = DQ + bid * dq_stride_b + hid * dq_stride_h + offs_m[:, None] * dq_stride_m + offs_d[None, :] * dq_stride_k
     tl.store(dq_ptrs, dq_acc.to(DQ.dtype.element_ty), mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim))
-
-    # (removed duplicate debug storage after loop) 
