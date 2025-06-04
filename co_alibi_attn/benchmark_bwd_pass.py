@@ -8,6 +8,26 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from co_alibi_attn import co_alibi_attention
 
+def print_red_warning(message):
+    print(f"\033[31mWARNING: {message}\033[0m")
+
+def calc_sim(x, y, name="tensor"):
+    x, y = x.data.double(), y.data.double()
+    denominator = (x * x + y * y).sum()
+    if denominator == 0:
+        print_red_warning(f'{name} all zero')
+        return 1.0
+    sim = 2 * (x * y).sum() / denominator
+    return sim.item()
+
+def assert_similar(x, y, eps=1e-8, name="tensor"):
+    sim = calc_sim(x, y, name)
+    diff = 1. - sim
+    if not (0 <= diff <= eps):
+        print_red_warning(f'{name} Error: {diff}')
+    else:
+        print(f'passed: {name} diff={diff:.2e}')
+
 def ref_forward(q, k, v, scale_factor):
     B, H, M, _ = q.shape
     N = k.shape[2]
@@ -27,19 +47,10 @@ def ref_forward(q, k, v, scale_factor):
     out = torch.einsum("bhmn,bhnd->bhmd", s, v)
     return out, (p_raw.detach(), sig.detach(), z_penalty.detach(), s.detach())
 
-def first_mismatch(a: torch.Tensor, b: torch.Tensor, atol=1e-3, rtol=5e-3):
-    diff = torch.abs(a - b)
-    mask = diff > (atol + rtol * torch.abs(b))
-    if not mask.any():
-        return None
-    idx = mask.nonzero(as_tuple=False)[0]
-    return tuple(idx.tolist()), a[tuple(idx)].item(), b[tuple(idx)].item(), diff[tuple(idx)].item()
-
-
 def main():
     torch.manual_seed(0)
 
-    B, H, S, D = 1, 16, 1024, 128
+    B, H, S, D = 1, 16, 4096, 128
     dtype = torch.float32
     device = "cuda"
 
@@ -78,31 +89,14 @@ def main():
         if debug_s is not None:
             print("softmax s diff:", (debug_s - s_ref).abs().max().item())
 
-    # ---------------- Comparison --------------------------------------------
     print("Forward output diff       :", (out_tri - out_ref).abs().max().item())
     print("dq max diff (abs)         :", (dq_tri - dq_ref).abs().max().item())
     print("dk max diff (abs)         :", (dk_tri - dk_ref).abs().max().item())
     print("dv max diff (abs)         :", (dv_tri - dv_ref).abs().max().item())
 
-    # report first mismatches if any
-    for name, a, b in [
-        ("dq", dq_tri, dq_ref),
-        ("dk", dk_tri, dk_ref),
-        ("dv", dv_tri, dv_ref),
-    ]:
-        mm = first_mismatch(a, b, atol=1e-2, rtol=1e-2)
-        if mm is None:
-            print(f"{name:>4} : OK (allclose)")
-        else:
-            idx, va, vb, vd = mm
-            print(f"{name:>4} : mismatch at {idx}  tri={va:.6g}  ref={vb:.6g} |diff|={vd:.3g}")
-
-    # Intermediate sanity print (optional) -----------------------------------
-    print("\n--- Reference intermediate stats (mean, max) ---")
-    tags = ["p_raw", "sigmoid", "z_penalty", "softmax"]
-    for tag, tensor in zip(tags, ref_intermediates):
-        print(f"{tag:<10}: mean={tensor.mean().item():.4e}  max={tensor.abs().max().item():.4e}")
-
+    assert_similar(dq_tri, dq_ref, eps=1e-4, name="dq") 
+    assert_similar(dk_tri, dk_ref, eps=1e-4, name="dk")
+    assert_similar(dv_tri, dv_ref, eps=1e-4, name="dv")
 
 if __name__ == "__main__":
     main() 

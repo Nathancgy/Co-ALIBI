@@ -4,6 +4,26 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from co_alibi_attn import co_alibi_attention
 
+def print_red_warning(message):
+    print(f"\033[31mWARNING: {message}\033[0m")
+
+def calc_sim(x, y, name="tensor"):
+    x, y = x.data.double(), y.data.double()
+    denominator = (x * x + y * y).sum()
+    if denominator == 0:
+        print_red_warning(f'{name} all zero')
+        return 1.0
+    sim = 2 * (x * y).sum() / denominator
+    return sim.item()
+
+def assert_similar(x, y, eps=1e-8, name="tensor"):
+    sim = calc_sim(x, y, name)
+    diff = 1. - sim
+    if not (0 <= diff <= eps):
+        print_red_warning(f'{name} Error: {diff}')
+    else:
+        print(f'passed: {name} diff={diff:.2e}')
+
 def ref_forward(q, k, v, scale_factor, return_intermediates=False, verbose=False):
     B, H, N_q, _ = q.shape
     N_k = k.shape[2]
@@ -47,16 +67,8 @@ def ref_forward(q, k, v, scale_factor, return_intermediates=False, verbose=False
         return o, p_raw, sig_p_raw, z_penalty, lse_val
     return o
 
-def first_mismatch(a: torch.Tensor, b: torch.Tensor, atol=1e-3, rtol=5e-3):
-    diff = torch.abs(a - b)
-    mask = diff > (atol + rtol * torch.abs(b))
-    if not mask.any():
-        return None
-    idx = mask.nonzero(as_tuple=False)[0]
-    return tuple(idx.tolist()), a[tuple(idx)].item(), b[tuple(idx)].item(), diff[tuple(idx)].item()
-
 def main():
-    B, H, N_q, N_k, D = 4, 8, 1024, 1024, 64 
+    B, H, N_q, N_k, D = 1, 16, 4096, 4096, 128
     dtype = torch.bfloat16
 
     torch.manual_seed(0)
@@ -73,36 +85,7 @@ def main():
     o_tri = co_alibi_attention(q, k, v, causal=True, sm_scale=scale)
 
     print("\n--- Numerical comparison ---")
-    mm = first_mismatch(o_tri, o_ref)
-    if mm is None:
-        print("output : OK (allclose)")
-    else:
-        idx, a, b, d = mm
-        print(f"output : mismatch at {idx}  tri={a:.6g}  ref={b:.6g} |diff|={d:.3g}")
-
-    import time
-
-    WARMUP = 10
-    ITERS  = 100
-
-    def time_fn(fn, *args):
-        for _ in range(WARMUP):
-            fn(*args)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(ITERS):
-            fn(*args)
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        return (t1 - t0) * 1000 / ITERS
-
-    with torch.no_grad():
-        ms_ref  = time_fn(lambda a,b,c: ref_forward(a,b,c, scale_factor=scale), q, k, v)
-        ms_tri  = time_fn(lambda a,b,c: co_alibi_attention(a,b,c, causal=True, sm_scale=scale)[0], q, k, v)
-
-    print("\n--- Performance ---")
-    print(f"PyTorch reference : {ms_ref:.3f} ms / fwd")
-    print(f"Triton kernel     : {ms_tri:.3f} ms / fwd  (speed-up ×{ms_ref / ms_tri:.2f})")
+    assert_similar(o_tri, o_ref, eps=1e-4, name="output")
 
 if __name__ == "__main__":
     main() 

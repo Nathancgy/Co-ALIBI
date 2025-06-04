@@ -78,7 +78,6 @@ class CoALIBI(torch.autograd.Function):
         return dq, dk, dv, None
 
 def print_red_warning(message):
-    # ANSI转义序列：\\033[31m 设置文本为红色，\\033[0m 重置颜色
     print(f"\\033[31mWARNING: {message}\\033[0m")
 
 def calc_sim(x, y, name="tensor"):
@@ -114,7 +113,7 @@ if __name__ == '__main__':
         mask_bool = torch.triu(torch.ones(N, N, device=q.device, dtype=torch.bool), diagonal=1)
         expanded_mask_bool = mask_bool.unsqueeze(0).unsqueeze(0)
         
-        p_raw_masked_for_sigma = p_raw.masked_fill(expanded_mask_bool, -1e9) # Using a large negative for sigmoid stability
+        p_raw_masked_for_sigma = p_raw.masked_fill(expanded_mask_bool, -1e9)
         sig_p_raw = torch.sigmoid(p_raw_masked_for_sigma).masked_fill(expanded_mask_bool, 0.0)
         
         z_penalty = torch.cumsum(sig_p_raw.flip(dims=[-1]), dim=-1).flip(dims=[-1])
@@ -149,7 +148,6 @@ if __name__ == '__main__':
     output_custom.backward(do_test_ref) 
     dq_custom, dk_custom, dv_custom = q_test.grad.clone(), k_test.grad.clone(), v_test.grad.clone()
     
-    # --- Comparisons ---
     print("\n--- Forward Pass Comparison ---")
     assert_similar(output_custom, output_ref, eps=1e-5, name="Forward Output (o)")
 

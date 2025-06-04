@@ -29,16 +29,15 @@ def _sigmoid(x):
 @triton.jit
 def _co_alibi_fwd_kernel(
     Q, K, V, sm_scale, causal_mask_value,
-    P_raw_out, Sig_P_raw_out, Z_penalty_out, LSE_out,
+    LSE_out,
+    RowSigTotal_out,
     Out,
     q_stride_b, q_stride_h, q_stride_m, q_stride_k,
     k_stride_b, k_stride_h, k_stride_n, k_stride_k,
     v_stride_b, v_stride_h, v_stride_n, v_stride_d,
     out_stride_b, out_stride_h, out_stride_m, out_stride_d,
-    p_raw_out_stride_b, p_raw_out_stride_h, p_raw_out_stride_m, p_raw_out_stride_n,
-    sig_p_raw_out_stride_b, sig_p_raw_out_stride_h, sig_p_raw_out_stride_m, sig_p_raw_out_stride_n,
-    z_penalty_out_stride_b, z_penalty_out_stride_h, z_penalty_out_stride_m, z_penalty_out_stride_n,
     lse_out_stride_b, lse_out_stride_h, lse_out_stride_m,
+    row_sig_out_stride_b, row_sig_out_stride_h, row_sig_out_stride_m,
     batch_size: tl.constexpr, num_heads: tl.constexpr,
     seq_len_q: tl.constexpr, seq_len_kv: tl.constexpr, head_dim: tl.constexpr,
     HAS_CAUSAL_MASK: tl.constexpr,
@@ -119,3 +118,7 @@ def _co_alibi_fwd_kernel(
     lse_flat = tl.reshape(lse_val, (BLOCK_M,)) 
     lse_ptrs = LSE_out + bid * lse_out_stride_b + hid * lse_out_stride_h + offs_m * lse_out_stride_m
     tl.store(lse_ptrs, lse_flat.to(LSE_out.dtype.element_ty), mask=offs_m < seq_len_q) 
+
+    row_sig_total_flat = tl.reshape(z_running, (BLOCK_M,))
+    row_sig_ptrs = RowSigTotal_out + bid * row_sig_out_stride_b + hid * row_sig_out_stride_h + offs_m * row_sig_out_stride_m
+    tl.store(row_sig_ptrs, row_sig_total_flat.to(RowSigTotal_out.dtype.element_ty), mask=offs_m < seq_len_q) 
