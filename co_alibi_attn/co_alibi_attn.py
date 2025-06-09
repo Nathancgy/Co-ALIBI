@@ -15,7 +15,6 @@ class CoALIBIAttention(torch.autograd.Function):
 
         assert k.shape == (batch_size, num_heads, seq_len_kv, head_dim)
         assert v.shape == (batch_size, num_heads, seq_len_kv, head_dim)
-        assert q.dtype == k.dtype == v.dtype, "All inputs must have the same dtype"
         assert q.is_cuda and k.is_cuda and v.is_cuda, "Inputs must be CUDA tensors"
 
         o = torch.empty_like(q)
@@ -67,12 +66,8 @@ class CoALIBIAttention(torch.autograd.Function):
         batch_size, num_heads, seq_len_q, _ = q.shape
         _, _, seq_len_kv, _ = k.shape
 
-        if seq_len_kv > 2048:
-            BLOCK_M_triton = 16
-            BLOCK_N_triton = 32
-        else:
-            BLOCK_M_triton = 16
-            BLOCK_N_triton = 32
+        BLOCK_M_triton = 64
+        BLOCK_N_triton = 32
         
         BLOCK_N_KV_triton = BLOCK_N_triton
         BLOCK_DMODEL_triton = head_dim

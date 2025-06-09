@@ -66,7 +66,6 @@ def _co_alibi_fwd_kernel(
         offs_n = start_k + tl.arange(0, BLOCK_N)
         row_end = pid_m * BLOCK_M + (BLOCK_M - 1)
         proceed = (not HAS_CAUSAL_MASK) or (start_k <= row_end)
-
         if proceed:
             k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[:, None] * k_stride_n + offs_d[None, :] * k_stride_k
             k_block_nd = tl.load(k_ptrs, mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim), other=0.0)

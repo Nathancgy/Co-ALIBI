@@ -34,14 +34,13 @@ def ref_forward(q, k, v, scale_factor):
 
     p_raw = torch.einsum("bhmd,bhnd->bhmn", q, k) * scale_factor
     causal_mask = torch.triu(torch.ones(M, N, device=q.device, dtype=torch.bool), 1)
-    mask_value = -torch.finfo(p_raw.dtype).max
-
-    p_raw_mask_sig = p_raw.masked_fill(causal_mask, -1e9)
+    dtype_min_neg = -torch.finfo(p_raw.dtype).max
+    p_raw_mask_sig = p_raw.masked_fill(causal_mask, dtype_min_neg)
     sig = torch.sigmoid(p_raw_mask_sig).masked_fill(causal_mask, 0.0)
 
     z_penalty = torch.cumsum(sig.flip(-1), -1).flip(-1)
-    p_adj = p_raw.masked_fill(causal_mask, mask_value) - z_penalty
-    p_adj = p_adj.masked_fill(causal_mask, mask_value)
+    p_adj = p_raw.masked_fill(causal_mask, dtype_min_neg) - z_penalty
+    p_adj = p_adj.masked_fill(causal_mask, dtype_min_neg)
 
     s = torch.softmax(p_adj, dim=-1).masked_fill(causal_mask, 0.0)
     out = torch.einsum("bhmn,bhnd->bhmd", s, v)
@@ -51,7 +50,7 @@ def main():
     torch.manual_seed(0)
 
     B, H, S, D = 1, 16, 4096, 128
-    dtype = torch.float32
+    dtype = torch.float16
     device = "cuda"
 
     q = torch.randn(B, H, S, D, device=device, dtype=dtype, requires_grad=True)
