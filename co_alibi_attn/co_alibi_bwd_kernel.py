@@ -8,7 +8,9 @@ def _sigmoid(x):
     return 1.0 / (1.0 + tl.exp2(-x * LOG2_E))
 
 _bwd_configs = [
-    triton.Config({"BLOCK_M": 64, "BLOCK_N_KV": 32},  num_warps=4, num_stages=4),
+    # Baseline config (kept for reference)
+    triton.Config({"BLOCK_M": 64,  "BLOCK_N_KV": 32},  num_warps=4, num_stages=4)
+
 ]
 
 def _prune_bwd(configs, named_args, **meta):
@@ -52,10 +54,10 @@ def _co_alibi_bwd_kernel(
     q_blk  = tl.load(q_ptrs, mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0)
 
     do_ptrs = DO + bid * do_stride_b + hid * do_stride_h + offs_m[:, None] * do_stride_m + offs_d[None, :] * do_stride_d
-    do_blk  = tl.load(do_ptrs, mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0).to(tl.float16)
+    do_blk  = tl.load(do_ptrs, mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0).to(tl.bfloat16)
 
     o_ptrs = O + bid * o_stride_b + hid * o_stride_h + offs_m[:, None] * o_stride_m + offs_d[None, :] * o_stride_d
-    o_blk  = tl.load(o_ptrs, mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0).to(tl.float16)
+    o_blk  = tl.load(o_ptrs, mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim), other=0.0).to(tl.bfloat16)
 
     lse_ptrs = LSE_in + bid * lse_in_stride_b + hid * lse_in_stride_h + offs_m * lse_in_stride_m
     lse_row  = tl.load(lse_ptrs, mask=offs_m < seq_len_q, other=0.0)[:, None]
@@ -77,7 +79,7 @@ def _co_alibi_bwd_kernel(
             k_ptrs = K + bid * k_stride_b + hid * k_stride_h + offs_n[None, :] * k_stride_n + offs_d[:, None] * k_stride_k
             k_blk  = tl.load(k_ptrs, mask=(offs_n[None, :] < seq_len_kv) & (offs_d[:, None] < head_dim), other=0.0)
             v_ptrs = V + bid * v_stride_b + hid * v_stride_h + offs_n[:, None] * v_stride_n + offs_d[None, :] * v_stride_d
-            v_blk  = tl.load(v_ptrs, mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim), other=0.0).to(tl.float16)
+            v_blk  = tl.load(v_ptrs, mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim), other=0.0).to(tl.bfloat16)
 
             p_raw = tl.dot(q_blk, k_blk, allow_tf32=False) * sm_scale
             causal_mask = offs_m[:, None] < offs_n[None, :]
@@ -108,7 +110,7 @@ def _co_alibi_bwd_kernel(
                 s = tl.where(causal_mask, 0.0, s)
             s = tl.where(valid_mask, s, 0.0)
 
-            dv_contrib = tl.dot(tl.trans(s.to(tl.float16)), do_blk, allow_tf32=False)
+            dv_contrib = tl.dot(tl.trans(s.to(tl.bfloat16)), do_blk, allow_tf32=False)
             dv_ptrs = DV + bid * dv_stride_b + hid * dv_stride_h + pid_m * dv_stride_s + offs_n[:, None] * dv_stride_n + offs_d[None, :] * dv_stride_d
             tl.store(dv_ptrs, dv_contrib.to(DV.dtype.element_ty), mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim))
 
@@ -130,12 +132,12 @@ def _co_alibi_bwd_kernel(
                 dp_raw = tl.where(causal_mask, 0.0, dp_raw)
             dp_raw = tl.where(valid_mask, dp_raw, 0.0)
 
-            dp_scaled_half = (dp_raw * sm_scale).to(tl.float16)
-            dk_contrib = tl.dot(tl.trans(dp_scaled_half), q_blk.to(tl.float16), allow_tf32=False)
+            dp_scaled_half = (dp_raw * sm_scale).to(tl.bfloat16)
+            dk_contrib = tl.dot(tl.trans(dp_scaled_half), q_blk.to(tl.bfloat16), allow_tf32=False)
             dk_ptrs = DK + bid * dk_stride_b + hid * dk_stride_h + pid_m * dk_stride_s + offs_n[:, None] * dk_stride_n + offs_d[None, :] * dk_stride_k
             tl.store(dk_ptrs, dk_contrib.to(DK.dtype.element_ty), mask=(offs_n[:, None] < seq_len_kv) & (offs_d[None, :] < head_dim))
 
-            dq_acc += tl.dot(dp_scaled_half, tl.trans(k_blk.to(tl.float16)), allow_tf32=False)
+            dq_acc += tl.dot(dp_scaled_half, tl.trans(k_blk.to(tl.bfloat16)), allow_tf32=False)
 
     dq_ptrs = DQ + bid * dq_stride_b + hid * dq_stride_h + offs_m[:, None] * dq_stride_m + offs_d[None, :] * dq_stride_k
     tl.store(dq_ptrs, dq_acc.to(DQ.dtype.element_ty), mask=(offs_m[:, None] < seq_len_q) & (offs_d[None, :] < head_dim))

@@ -50,7 +50,7 @@ def main():
     torch.manual_seed(0)
 
     B, H, S, D = 1, 16, 4096, 128
-    dtype = torch.float16
+    dtype = torch.bfloat16
     device = "cuda"
 
     q = torch.randn(B, H, S, D, device=device, dtype=dtype, requires_grad=True)
@@ -92,6 +92,17 @@ def main():
     print("dq max diff (abs)         :", (dq_tri - dq_ref).abs().max().item())
     print("dk max diff (abs)         :", (dk_tri - dk_ref).abs().max().item())
     print("dv max diff (abs)         :", (dv_tri - dv_ref).abs().max().item())
+
+    # Print the first ten flattened elements of both reference and Triton gradients for q and k to inspect if they are zero
+    first_ten_dq_ref = dq_ref.flatten()[:10].tolist()
+    first_ten_dq_tri = dq_tri.flatten()[:10].tolist()
+    first_ten_dk_ref = dk_ref.flatten()[:10].tolist()
+    first_ten_dk_tri = dk_tri.flatten()[:10].tolist()
+
+    print("First 10 elements dq_ref:", first_ten_dq_ref)
+    print("First 10 elements dq_tri:", first_ten_dq_tri)
+    print("First 10 elements dk_ref:", first_ten_dk_ref)
+    print("First 10 elements dk_tri:", first_ten_dk_tri)
 
     assert_similar(dq_tri, dq_ref, eps=1e-4, name="dq") 
     assert_similar(dk_tri, dk_ref, eps=1e-4, name="dk")

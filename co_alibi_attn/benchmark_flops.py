@@ -2,7 +2,14 @@ import math
 import os
 import sys
 import torch
-import triton # type: ignore[import-unresolved]
+import triton  # type: ignore[import-unresolved]
+
+# Try to import FlashAttention 2. If unavailable, we will skip its benchmark gracefully.
+try:
+    from flash_attn.flash_attn_interface import flash_attn_func  # type: ignore
+    _HAS_FLASH_ATTN = True
+except Exception:
+    _HAS_FLASH_ATTN = False
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -13,8 +20,8 @@ def benchmark_fwd_bwd_flops(
     H: int = 16,
     seq_lens: set[int] | list[int] = (4096,),
     D: int = 128,
-    q_dtype: torch.dtype = torch.float32,
-    k_dtype: torch.dtype = torch.float32,
+    q_dtype: torch.dtype = torch.float16,
+    k_dtype: torch.dtype = torch.float16,
     v_dtype: torch.dtype = torch.float16,
 ):
     device = "cuda"
@@ -84,12 +91,60 @@ def benchmark_fwd_bwd_flops(
         torch.cuda.synchronize()
         ms_bwd = start_event.elapsed_time(end_event) / NUM_REPS
 
+        # ------------------ FlashAttention 2 benchmark (optional) ------------------
+        if _HAS_FLASH_ATTN:
+            # FlashAttention expects shapes (B, S, H, D). We'll permute.
+            q_fla = q_val.permute(0, 2, 1, 3).contiguous()
+            k_fla = k_val.permute(0, 2, 1, 3).contiguous()
+            v_fla = v_val.permute(0, 2, 1, 3).contiguous()
+
+            # Forward timing
+            for _ in range(NUM_WARMUP):
+                _ = flash_attn_func(q_fla, k_fla, v_fla, softmax_scale=sm_scale, causal=True)
+            torch.cuda.synchronize()
+            start_event.record()
+            for _ in range(NUM_REPS):
+                _ = flash_attn_func(q_fla, k_fla, v_fla, softmax_scale=sm_scale, causal=True)
+            end_event.record()
+            torch.cuda.synchronize()
+            ms_fwd_flash = start_event.elapsed_time(end_event) / NUM_REPS
+
+            # Backward timing
+            q_fla_b = q_val.permute(0, 2, 1, 3).contiguous().requires_grad_(True)
+            k_fla_b = k_val.permute(0, 2, 1, 3).contiguous().requires_grad_(True)
+            v_fla_b = v_val.permute(0, 2, 1, 3).contiguous().requires_grad_(True)
+            dout_fla = dout_val.permute(0, 2, 1, 3).contiguous()
+
+            for _ in range(NUM_WARMUP):
+                if q_fla_b.grad is not None: q_fla_b.grad.zero_()
+                if k_fla_b.grad is not None: k_fla_b.grad.zero_()
+                if v_fla_b.grad is not None: v_fla_b.grad.zero_()
+                out = flash_attn_func(q_fla_b, k_fla_b, v_fla_b, softmax_scale=sm_scale, causal=True)
+                out.backward(dout_fla, retain_graph=True)
+            torch.cuda.synchronize()
+            start_event.record()
+            for _ in range(NUM_REPS):
+                if q_fla_b.grad is not None: q_fla_b.grad.zero_()
+                if k_fla_b.grad is not None: k_fla_b.grad.zero_()
+                if v_fla_b.grad is not None: v_fla_b.grad.zero_()
+                out_bwd_fla = flash_attn_func(q_fla_b, k_fla_b, v_fla_b, softmax_scale=sm_scale, causal=True)
+                out_bwd_fla.backward(dout_fla, retain_graph=True)
+            end_event.record()
+            torch.cuda.synchronize()
+            ms_bwd_flash = start_event.elapsed_time(end_event) / NUM_REPS
+        else:
+            ms_fwd_flash = ms_bwd_flash = None
+
         SKV = S
         flops_fwd = B * H * S * SKV * (4 * D)
         flops_bwd = 2 * flops_fwd
 
         tflops_fwd = flops_fwd / (ms_fwd * 1e-3) / 1e12
         tflops_bwd = flops_bwd / (ms_bwd * 1e-3) / 1e12
+
+        if _HAS_FLASH_ATTN:
+            tflops_fwd_flash = flops_fwd / (ms_fwd_flash * 1e-3) / 1e12
+            tflops_bwd_flash = flops_bwd / (ms_bwd_flash * 1e-3) / 1e12
 
         line = "=" * 80
         print(line)
@@ -99,10 +154,15 @@ def benchmark_fwd_bwd_flops(
         )
         print(f"Forward FLOPs: {flops_fwd/1e12:.2f} TF, Backward FLOPs: {flops_bwd/1e12:.2f} TF")
         print(line)
-        print(f"{'Operation':<10} {'Latency (ms)':>15}   {'TFLOP/s':>9}")
+        print(f"{'Operation':<20} {'Latency (ms)':>15}   {'TFLOP/s':>9}")
         print("-" * 80)
-        print(f"{'Forward':<10} {ms_fwd:15.3f}   {tflops_fwd:9.2f}")
-        print(f"{'Backward':<10} {ms_bwd:15.3f}   {tflops_bwd:9.2f}")
+        print(f"{'CoALIBI Forward':<20} {ms_fwd:15.3f}   {tflops_fwd:9.2f}")
+        print(f"{'CoALIBI Backward':<20} {ms_bwd:15.3f}   {tflops_bwd:9.2f}")
+        if _HAS_FLASH_ATTN:
+            print(f"{'FlashAttn2 Forward':<20} {ms_fwd_flash:15.3f}   {tflops_fwd_flash:9.2f}")
+            print(f"{'FlashAttn2 Backward':<20} {ms_bwd_flash:15.3f}   {tflops_bwd_flash:9.2f}")
+        else:
+            print("FlashAttention 2 not available; skipping its benchmark.")
         print(line)
 
 if __name__ == "__main__":
