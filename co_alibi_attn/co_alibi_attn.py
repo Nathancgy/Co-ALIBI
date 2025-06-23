@@ -77,7 +77,7 @@ class CoALIBIAttention(torch.autograd.Function):
         dk_partial = torch.empty(
             (batch_size, num_heads, grid_m, seq_len_kv, head_dim),
             device=q.device,
-            dtype=torch.float32,
+            dtype=q.dtype
         )
         dv_partial = torch.empty_like(dk_partial)
 
