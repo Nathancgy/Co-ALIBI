@@ -9,32 +9,15 @@ from .co_alibi_fwd_kernel import _co_alibi_fwd_kernel
 from .co_alibi_bwd_kernel import _co_alibi_bwd_kernel
 
 def _get_coalibi_slopes(n_heads: int, bias_max: float = 8.0) -> torch.Tensor:
-    """Generate per-head ALiBi slopes.
-
-    We keep them identical to vanilla ALiBi here; the *2×* factor required by
-    Co-ALiBi will be applied later in `co_alibi_attention` before the slopes
-    are passed to the Triton kernels."""
     def get_slopes(n_heads):
-        # Get the closest power of 2 to n_heads
         n = 2 ** math.floor(math.log2(n_heads))
-        # Calculate m_0 = 2^(-bias_max/n)
         m_0 = 2.0 ** (-bias_max / n)
-        # Calculate slopes: 2^(-1*bias_max/n), 2^(-2*bias_max/n), ...
         m = torch.pow(m_0, torch.arange(1, 1 + n))
-        
-        # If n_heads is not a power of 2, add remaining slopes
         if n < n_heads:
-            # Calculate remaining slopes for n*2 (avoiding slopes added previously)
             m_hat_0 = 2.0 ** (-(bias_max/2) / n)
-            # Take steps by 2 to avoid slopes added previously
             m_hat = torch.pow(m_hat_0, torch.arange(1, 1 + 2 * (n_heads - n), 2))
             m = torch.cat([m, m_hat])
-        
         return m
-    
-    # Vanilla ALiBi slopes (positive). The 2× scaling is already baked into
-    # the kernels via `sig_blk_scaled = 2 * sigmoid(...)`, so we **must not**
-    # multiply them again here.
     alibi_slopes = get_slopes(n_heads)
     return torch.abs(alibi_slopes)
 
@@ -50,7 +33,6 @@ class CoALIBIAttention(torch.autograd.Function):
         assert slopes.shape == (num_heads,), f"Slopes shape {slopes.shape} doesn't match num_heads {num_heads}"
 
         o = torch.empty_like(q)
-        
         lse = torch.empty((batch_size, num_heads, seq_len_q), device=q.device, dtype=torch.float32)
         row_sig_total = torch.empty((batch_size, num_heads, seq_len_q), device=q.device, dtype=torch.float32)
 
@@ -156,19 +138,11 @@ def co_alibi_attention(q, k, v, causal=True, sm_scale=None, bias_max=8.0):
     if sm_scale is None:
         sm_scale = 1.0 / (q.shape[-1]**0.5)
     q,k,v = q.contiguous(), k.contiguous(), v.contiguous()
-    
-    # Handle Grouped Query Attention (GQA)
     batch_size, num_q_heads, seq_len_q, head_dim = q.shape
     _, num_kv_heads, seq_len_kv, _ = k.shape
-    
     if num_kv_heads < num_q_heads:
-        # Expand K and V to match number of Q heads
         num_groups = num_q_heads // num_kv_heads
         k = k.repeat_interleave(num_groups, dim=1)
         v = v.repeat_interleave(num_groups, dim=1)
-    
-    # Generate per-head ALiBi slopes and apply the 2× factor here so the
-    # kernels can operate on plain σ(·) values.
     slopes = (2.0 * _get_coalibi_slopes(num_q_heads, bias_max)).to(q.device, dtype=q.dtype)
-    
     return CoALIBIAttention.apply(q, k, v, slopes, causal, sm_scale)

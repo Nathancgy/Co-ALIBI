@@ -8,9 +8,7 @@ def _sigmoid(x):
     return 1.0 / (1.0 + tl.exp2(-x * LOG2_E))
 
 _bwd_configs = [
-    # Baseline config (kept for reference)
     triton.Config({"BLOCK_M": 128,  "BLOCK_N_KV": 64},  num_warps=4, num_stages=4)
-
 ]
 
 def _prune_bwd(configs, named_args, **meta):
@@ -44,7 +42,6 @@ def _co_alibi_bwd_kernel(
     bid    = pid_bh // num_heads
     hid    = pid_bh % num_heads
 
-    # Load the slope for this head
     slopes_ptr = Slopes + hid
     slope = tl.load(slopes_ptr)
 
@@ -98,7 +95,6 @@ def _co_alibi_bwd_kernel(
             sig = tl.where(valid_mask, sig, 0.0)
             sig_f32 = sig.to(tl.float32)
 
-            # σ(q·k) without extra scaling (slope already absorbs 2× factor)
             sig_scaled = sig_f32
 
             prefix_sig_local = tl.cumsum(sig_scaled, axis=1)
@@ -109,7 +105,6 @@ def _co_alibi_bwd_kernel(
                 p_raw = tl.where(causal_mask, causal_mask_value, p_raw)
             p_raw = tl.where(valid_mask, p_raw, causal_mask_value)
 
-            # Apply head-specific slope: p_adj = p_raw - α * z_penalty
             p_adj = p_raw - slope * z_penalty
             log_s = p_adj - lse_row
             s = tl.exp(log_s)
@@ -127,7 +122,6 @@ def _co_alibi_bwd_kernel(
                 dp_adj = tl.where(causal_mask, 0.0, dp_adj)
             dp_adj = tl.where(valid_mask, dp_adj, 0.0)
 
-            # Gradient wrt σ(q·k): σ'(x)
             sigma_prime = sig_f32 * (1.0 - sig_f32)
             sigma_prime = tl.minimum(sigma_prime, 0.25)
             sigma_prime_scaled = sigma_prime
@@ -136,7 +130,6 @@ def _co_alibi_bwd_kernel(
             c_block = prefix_dp_adj_row + prefix_dp_local
             prefix_dp_adj_row += tl.sum(dp_adj, axis=1)[:, None]
 
-            # Apply slope to the derivative of the penalty term
             dp_raw = dp_adj - slope * sigma_prime_scaled * c_block
             if HAS_CAUSAL_MASK:
                 dp_raw = tl.where(causal_mask, 0.0, dp_raw)
