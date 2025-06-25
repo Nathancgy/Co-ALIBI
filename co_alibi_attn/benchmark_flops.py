@@ -11,7 +11,7 @@ try:
 except Exception:
     _HAS_FLASH_ATTN = False
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from co_alibi_attn import co_alibi_attention
 

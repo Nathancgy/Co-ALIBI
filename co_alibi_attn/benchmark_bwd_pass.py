@@ -4,9 +4,10 @@ import sys
 
 import torch
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from co_alibi_attn import co_alibi_attention
+from co_alibi_attn.co_alibi_attn import _get_coalibi_slopes
 
 def print_red_warning(message):
     print(f"\033[31mWARNING: {message}\033[0m")
@@ -28,9 +29,13 @@ def assert_similar(x, y, eps=1e-8, name="tensor"):
     else:
         print(f'passed: {name} diff={diff:.2e}')
 
-def ref_forward(q, k, v, scale_factor):
+def ref_forward(q, k, v, scale_factor, bias_max=8.0):
+    """Reference forward producing intermediates matching current kernels."""
     B, H, M, _ = q.shape
     N = k.shape[2]
+
+    slopes = 2.0 * _get_coalibi_slopes(H, bias_max=bias_max).to(device=q.device, dtype=q.dtype)
+    slopes = slopes.view(1, H, 1, 1)
 
     p_raw = torch.einsum("bhmd,bhnd->bhmn", q, k) * scale_factor
     causal_mask = torch.triu(torch.ones(M, N, device=q.device, dtype=torch.bool), 1)
@@ -39,7 +44,7 @@ def ref_forward(q, k, v, scale_factor):
     sig = torch.sigmoid(p_raw_mask_sig).masked_fill(causal_mask, 0.0)
 
     z_penalty = torch.cumsum(sig.flip(-1), -1).flip(-1)
-    p_adj = p_raw.masked_fill(causal_mask, dtype_min_neg) - z_penalty
+    p_adj = p_raw.masked_fill(causal_mask, dtype_min_neg) - slopes * z_penalty
     p_adj = p_adj.masked_fill(causal_mask, dtype_min_neg)
 
     s = torch.softmax(p_adj, dim=-1).masked_fill(causal_mask, 0.0)
@@ -80,7 +85,10 @@ def main():
         sum_ds_s_ref = (ds_ref * s_ref).sum(dim=-1, keepdim=True)
         dp_adj_ref = s_ref * (ds_ref - sum_ds_s_ref)
         c_prefix_ref = torch.cumsum(dp_adj_ref, dim=-1)
-        dp_raw_ref = dp_adj_ref - sigma_prime_ref * c_prefix_ref
+
+        slopes_dbg = 2.0 * _get_coalibi_slopes(H).to(device=q.device, dtype=q.dtype)
+        slopes_dbg = slopes_dbg.view(1, H, 1, 1)
+        dp_raw_ref = dp_adj_ref - slopes_dbg * sigma_prime_ref * c_prefix_ref
 
         print("\n--- Debug backward intermediates (max abs diff) ---")
         if debug_dp_raw is not None:

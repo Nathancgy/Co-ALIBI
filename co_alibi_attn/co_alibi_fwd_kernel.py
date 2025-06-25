@@ -18,8 +18,7 @@ _configs = [
 ]
 
 def _prune_configs(configs, named_args, **kwargs):
-    seq_len_q = kwargs.get("seq_len_q", 0)
-    return [cfg for cfg in configs if cfg.kwargs["BLOCK_M"] <= seq_len_q]
+    return configs
 
 @triton.jit
 def _sigmoid(x):
@@ -28,7 +27,7 @@ def _sigmoid(x):
 @triton.autotune(configs=_configs, key=["seq_len_q", "head_dim"], prune_configs_by={"early_config_prune": _prune_configs})
 @triton.jit
 def _co_alibi_fwd_kernel(
-    Q, K, V, sm_scale, causal_mask_value,
+    Q, K, V, Slopes, sm_scale, causal_mask_value,
     LSE_out,
     RowSigTotal_out,
     Out,
@@ -48,6 +47,9 @@ def _co_alibi_fwd_kernel(
     pid_bh = tl.program_id(axis=1)
     bid = pid_bh // num_heads
     hid = pid_bh %  num_heads
+
+    slopes_ptr = Slopes + hid
+    slope = tl.load(slopes_ptr)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_D)
@@ -87,12 +89,14 @@ def _co_alibi_fwd_kernel(
                 sig_blk = tl.where(causal_mask, 0.0, sig_blk)
             sig_blk = tl.where(key_valid_mask, sig_blk, 0.0)
 
-            prefix_sum = tl.cumsum(sig_blk, 1)
-            row_total = tl.sum(sig_blk, 1)[:, None]
-            z_blk = row_total - prefix_sum + sig_blk + z_running
+            sig_blk_scaled = sig_blk
+
+            prefix_sum = tl.cumsum(sig_blk_scaled, 1)
+            row_total = tl.sum(sig_blk_scaled, 1)[:, None]
+            z_blk = row_total - prefix_sum + sig_blk_scaled + z_running
             z_running += row_total
 
-            p_adj_blk = p_raw_blk - z_blk
+            p_adj_blk = p_raw_blk - slope * z_blk
             if HAS_CAUSAL_MASK:
                 p_adj_blk = tl.where(causal_mask, causal_mask_value, p_adj_blk)
             p_adj_blk = tl.where(key_valid_mask, p_adj_blk, causal_mask_value)
